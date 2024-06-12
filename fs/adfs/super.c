@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/statfs.h>
 #include <linux/user_namespace.h>
+#include <linux/blkdev.h>
 #include "adfs.h"
 #include "dir_f.h"
 #include "dir_fplus.h"
@@ -209,8 +210,7 @@ static int adfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_namelen = sbi->s_namelen;
 	buf->f_bsize   = sb->s_blocksize;
 	buf->f_ffree   = (long)(buf->f_bfree * buf->f_files) / (long)buf->f_blocks;
-	buf->f_fsid.val[0] = (u32)id;
-	buf->f_fsid.val[1] = (u32)(id >> 32);
+	buf->f_fsid    = u64_to_fsid(id);
 
 	return 0;
 }
@@ -220,7 +220,7 @@ static struct kmem_cache *adfs_inode_cachep;
 static struct inode *adfs_alloc_inode(struct super_block *sb)
 {
 	struct adfs_inode_info *ei;
-	ei = kmem_cache_alloc(adfs_inode_cachep, GFP_KERNEL);
+	ei = alloc_inode_sb(sb, adfs_inode_cachep, GFP_KERNEL);
 	if (!ei)
 		return NULL;
 	return &ei->vfs_inode;
@@ -249,7 +249,7 @@ static int __init init_inodecache(void)
 	adfs_inode_cachep = kmem_cache_create("adfs_inode_cache",
 					     sizeof(struct adfs_inode_info),
 					     0, (SLAB_RECLAIM_ACCOUNT|
-						SLAB_MEM_SPREAD|SLAB_ACCOUNT),
+						SLAB_ACCOUNT),
 					     init_once);
 	if (adfs_inode_cachep == NULL)
 		return -ENOMEM;

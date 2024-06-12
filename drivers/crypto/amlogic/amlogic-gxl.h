@@ -95,7 +95,7 @@ struct meson_dev {
 	struct device *dev;
 	struct meson_flow *chanlist;
 	atomic_t flow;
-	int *irqs;
+	int irqs[MAXFLOW];
 #ifdef CONFIG_CRYPTO_DEV_AMLOGIC_GXL_DEBUG
 	struct dentry *dbgfs_dir;
 #endif
@@ -109,11 +109,11 @@ struct meson_dev {
 struct meson_cipher_req_ctx {
 	u32 op_dir;
 	int flow;
+	struct skcipher_request fallback_req;	// keep at the end
 };
 
 /*
  * struct meson_cipher_tfm_ctx - context for a skcipher TFM
- * @enginectx:		crypto_engine used by this TFM
  * @key:		pointer to key data
  * @keylen:		len of the key
  * @keymode:		The keymode(type and size of key) associated with this TFM
@@ -121,12 +121,11 @@ struct meson_cipher_req_ctx {
  * @fallback_tfm:	pointer to the fallback TFM
  */
 struct meson_cipher_tfm_ctx {
-	struct crypto_engine_ctx enginectx;
 	u32 *key;
 	u32 keylen;
 	u32 keymode;
 	struct meson_dev *mc;
-	struct crypto_sync_skcipher *fallback_tfm;
+	struct crypto_skcipher *fallback_tfm;
 };
 
 /*
@@ -142,7 +141,7 @@ struct meson_alg_template {
 	u32 type;
 	u32 blockmode;
 	union {
-		struct skcipher_alg skcipher;
+		struct skcipher_engine_alg skcipher;
 	} alg;
 	struct meson_dev *mc;
 #ifdef CONFIG_CRYPTO_DEV_AMLOGIC_GXL_DEBUG
@@ -159,3 +158,4 @@ int meson_cipher_init(struct crypto_tfm *tfm);
 void meson_cipher_exit(struct crypto_tfm *tfm);
 int meson_skdecrypt(struct skcipher_request *areq);
 int meson_skencrypt(struct skcipher_request *areq);
+int meson_handle_cipher_request(struct crypto_engine *engine, void *areq);

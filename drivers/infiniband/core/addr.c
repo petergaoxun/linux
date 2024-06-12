@@ -37,7 +37,6 @@
 #include <linux/inetdevice.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
-#include <linux/module.h>
 #include <net/arp.h>
 #include <net/neighbour.h>
 #include <net/route.h>
@@ -76,7 +75,9 @@ static struct workqueue_struct *addr_wq;
 
 static const struct nla_policy ib_nl_addr_policy[LS_NLA_TYPE_MAX] = {
 	[LS_NLA_TYPE_DGID] = {.type = NLA_BINARY,
-		.len = sizeof(struct rdma_nla_ls_gid)},
+		.len = sizeof(struct rdma_nla_ls_gid),
+		.validation_type = NLA_VALIDATE_MIN,
+		.min = sizeof(struct rdma_nla_ls_gid)},
 };
 
 static inline bool ib_nl_is_good_ip_resp(const struct nlmsghdr *nlh)
@@ -347,16 +348,10 @@ static int dst_fetch_ha(const struct dst_entry *dst,
 
 static bool has_gateway(const struct dst_entry *dst, sa_family_t family)
 {
-	struct rtable *rt;
-	struct rt6_info *rt6;
+	if (family == AF_INET)
+		return dst_rtable(dst)->rt_uses_gateway;
 
-	if (family == AF_INET) {
-		rt = container_of(dst, struct rtable, dst);
-		return rt->rt_uses_gateway;
-	}
-
-	rt6 = container_of(dst, struct rt6_info, dst);
-	return rt6->rt6i_flags & RTF_GATEWAY;
+	return dst_rt6_info(dst)->rt6i_flags & RTF_GATEWAY;
 }
 
 static int fetch_ha(const struct dst_entry *dst, struct rdma_dev_addr *dev_addr,
@@ -370,6 +365,8 @@ static int fetch_ha(const struct dst_entry *dst, struct rdma_dev_addr *dev_addr,
 		(const void *)&dst_in4->sin_addr.s_addr :
 		(const void *)&dst_in6->sin6_addr;
 	sa_family_t family = dst_in->sa_family;
+
+	might_sleep();
 
 	/* If we have a gateway in IB mode then it must be an IB network */
 	if (has_gateway(dst, family) && dev_addr->network == RDMA_NETWORK_IB)
@@ -645,13 +642,12 @@ static void process_one_req(struct work_struct *_work)
 	req->callback = NULL;
 
 	spin_lock_bh(&lock);
+	/*
+	 * Although the work will normally have been canceled by the workqueue,
+	 * it can still be requeued as long as it is on the req_list.
+	 */
+	cancel_delayed_work(&req->work);
 	if (!list_empty(&req->list)) {
-		/*
-		 * Although the work will normally have been canceled by the
-		 * workqueue, it can still be requeued as long as it is on the
-		 * req_list.
-		 */
-		cancel_delayed_work(&req->work);
 		list_del_init(&req->list);
 		kfree(req);
 	}
@@ -726,6 +722,8 @@ int roce_resolve_route_from_path(struct sa_path_rec *rec,
 	} sgid, dgid;
 	struct rdma_dev_addr dev_addr = {};
 	int ret;
+
+	might_sleep();
 
 	if (rec->roce.route_resolved)
 		return 0;

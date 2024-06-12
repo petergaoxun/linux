@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 or BSD-3-Clause */
+/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 
 /* Authors: Bernard Metzler <bmt@zurich.ibm.com> */
 /* Copyright (c) 2008-2019, IBM Corporation */
@@ -30,7 +30,6 @@
 #define SIW_MAX_MR (SIW_MAX_QP * 10)
 #define SIW_MAX_PD SIW_MAX_QP
 #define SIW_MAX_MW 0 /* to be set if MW's are supported */
-#define SIW_MAX_FMR SIW_MAX_MR
 #define SIW_MAX_SRQ SIW_MAX_QP
 #define SIW_MAX_SRQ_WR (SIW_MAX_QP_WR * 10)
 #define SIW_MAX_CONTEXT SIW_MAX_PD
@@ -59,7 +58,6 @@ struct siw_dev_cap {
 	int max_mr;
 	int max_pd;
 	int max_mw;
-	int max_fmr;
 	int max_srq;
 	int max_srq_wr;
 	int max_srq_sge;
@@ -71,12 +69,12 @@ struct siw_pd {
 
 struct siw_device {
 	struct ib_device base_dev;
-	struct device_dma_parameters dma_parms;
 	struct net_device *netdev;
 	struct siw_dev_cap attrs;
 
 	u32 vendor_part_id;
 	int numa_node;
+	char raw_gid[ETH_ALEN];
 
 	/* physical port state (only one port per device) */
 	enum ib_port_state state;
@@ -123,11 +121,10 @@ struct siw_page_chunk {
 };
 
 struct siw_umem {
+	struct ib_umem *base_mem;
 	struct siw_page_chunk *page_chunk;
 	int num_pages;
-	bool writable;
 	u64 fp_addr; /* First page base address */
-	struct mm_struct *owning_mm;
 };
 
 struct siw_pble {
@@ -139,7 +136,7 @@ struct siw_pble {
 struct siw_pbl {
 	unsigned int num_buf;
 	unsigned int max_buf;
-	struct siw_pble pbe[1];
+	struct siw_pble pbe[] __counted_by(max_buf);
 };
 
 /*
@@ -291,10 +288,11 @@ struct siw_rx_stream {
 	int skb_offset; /* offset in skb */
 	int skb_copied; /* processed bytes in skb */
 
+	enum siw_rx_state state;
+
 	union iwarp_hdr hdr;
 	struct mpa_trailer trailer;
-
-	enum siw_rx_state state;
+	struct shash_desc *mpa_crc_hd;
 
 	/*
 	 * For each FPDU, main RX loop runs through 3 stages:
@@ -316,7 +314,6 @@ struct siw_rx_stream {
 	u64 ddp_to;
 	u32 inval_stag; /* Stag to be invalidated */
 
-	struct shash_desc *mpa_crc_hd;
 	u8 rx_suspend : 1;
 	u8 pad : 2; /* # of pad bytes expected */
 	u8 rdmap_op : 4; /* opcode of current frame */
@@ -420,9 +417,10 @@ struct siw_iwarp_tx {
 struct siw_qp {
 	struct ib_qp base_qp;
 	struct siw_device *sdev;
-	struct kref ref;
-	struct list_head devq;
 	int tx_cpu;
+	struct kref ref;
+	struct completion qp_free;
+	struct list_head devq;
 	struct siw_qp_attrs attrs;
 
 	struct siw_cep *cep;
@@ -467,7 +465,6 @@ struct siw_qp {
 	} term_info;
 	struct rdma_user_mmap_entry *sq_entry; /* mmap info for SQE array */
 	struct rdma_user_mmap_entry *rq_entry; /* mmap info for RQE array */
-	struct rcu_head rcu;
 };
 
 /* helper macros */
@@ -532,11 +529,12 @@ void siw_qp_llp_data_ready(struct sock *sk);
 void siw_qp_llp_write_space(struct sock *sk);
 
 /* QP TX path functions */
+int siw_create_tx_threads(void);
+void siw_stop_tx_threads(void);
 int siw_run_sq(void *arg);
 int siw_qp_sq_process(struct siw_qp *qp);
 int siw_sq_start(struct siw_qp *qp);
 int siw_activate_tx(struct siw_qp *qp);
-void siw_stop_tx_thread(int nr_cpu);
 int siw_get_tx_cpu(struct siw_device *sdev);
 void siw_put_tx_cpu(int cpu);
 
@@ -647,16 +645,11 @@ static inline struct siw_sqe *orq_get_current(struct siw_qp *qp)
 	return &qp->orq[qp->orq_get % qp->attrs.orq_size];
 }
 
-static inline struct siw_sqe *orq_get_tail(struct siw_qp *qp)
-{
-	return &qp->orq[qp->orq_put % qp->attrs.orq_size];
-}
-
 static inline struct siw_sqe *orq_get_free(struct siw_qp *qp)
 {
-	struct siw_sqe *orq_e = orq_get_tail(qp);
+	struct siw_sqe *orq_e = &qp->orq[qp->orq_put % qp->attrs.orq_size];
 
-	if (orq_e && READ_ONCE(orq_e->flags) == 0)
+	if (READ_ONCE(orq_e->flags) == 0)
 		return orq_e;
 
 	return NULL;
@@ -664,7 +657,7 @@ static inline struct siw_sqe *orq_get_free(struct siw_qp *qp)
 
 static inline int siw_orq_empty(struct siw_qp *qp)
 {
-	return qp->orq[qp->orq_get % qp->attrs.orq_size].flags == 0 ? 1 : 0;
+	return orq_get_current(qp)->flags == 0 ? 1 : 0;
 }
 
 static inline struct siw_sqe *irq_alloc_free(struct siw_qp *qp)

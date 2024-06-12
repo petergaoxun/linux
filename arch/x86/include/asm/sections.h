@@ -14,4 +14,6 @@ extern char __end_rodata_hpage_align[];
 
 extern char __end_of_kernel_reserve[];
 
+extern unsigned long _brk_start, _brk_end;
+
 #endif	/* _ASM_X86_SECTIONS_H */

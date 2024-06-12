@@ -37,6 +37,7 @@ acpi_db_match_command_help(const char *command,
 enum acpi_ex_debugger_commands {
 	CMD_NOT_FOUND = 0,
 	CMD_NULL,
+	CMD_ALL,
 	CMD_ALLOCATIONS,
 	CMD_ARGS,
 	CMD_ARGUMENTS,
@@ -105,6 +106,7 @@ enum acpi_ex_debugger_commands {
 	CMD_THREADS,
 
 	CMD_TEST,
+	CMD_INTERRUPT,
 #endif
 };
 
@@ -115,6 +117,7 @@ enum acpi_ex_debugger_commands {
 static const struct acpi_db_command_info acpi_gbl_db_commands[] = {
 	{"<NOT FOUND>", 0},
 	{"<NULL>", 0},
+	{"ALL", 1},
 	{"ALLOCATIONS", 0},
 	{"ARGS", 0},
 	{"ARGUMENTS", 0},
@@ -183,6 +186,7 @@ static const struct acpi_db_command_info acpi_gbl_db_commands[] = {
 	{"THREADS", 3},
 
 	{"TEST", 1},
+	{"INTERRUPT", 1},
 #endif
 	{NULL, 0}
 };
@@ -222,6 +226,7 @@ static const struct acpi_db_command_help acpi_gbl_db_command_help[] = {
 	{1, "  Type <Object>", "Display object type\n"},
 
 	{0, "\nControl Method Execution:", "\n"},
+	{1, "  All <NameSeg>", "Evaluate all objects named NameSeg\n"},
 	{1, "  Evaluate <Namepath> [Arguments]",
 	 "Evaluate object or control method\n"},
 	{1, "  Execute <Namepath> [Arguments]", "Synonym for Evaluate\n"},
@@ -315,6 +320,7 @@ static const struct acpi_db_command_help acpi_gbl_db_command_help[] = {
 	{1, "  Gpes", "Display info on all GPE devices\n"},
 	{1, "  Sci", "Generate an SCI\n"},
 	{1, "  Sleep [SleepState]", "Simulate sleep/wake sequence(s) (0-5)\n"},
+	{1, "  Interrupt <GSIV>", "Simulate an interrupt\n"},
 #endif
 	{0, NULL, NULL}
 };
@@ -436,7 +442,7 @@ static void acpi_db_display_help(char *command)
 		acpi_os_printf("\n");
 
 	} else {
-		/* Display help for all commands that match the subtring */
+		/* Display help for all commands that match the substring */
 
 		acpi_db_display_command_info(command, TRUE);
 	}
@@ -468,16 +474,14 @@ char *acpi_db_get_next_token(char *string,
 		return (NULL);
 	}
 
-	/* Remove any spaces at the beginning */
+	/* Remove any spaces at the beginning, ignore blank lines */
 
-	if (*string == ' ') {
-		while (*string && (*string == ' ')) {
-			string++;
-		}
+	while (*string && isspace((int)*string)) {
+		string++;
+	}
 
-		if (!(*string)) {
-			return (NULL);
-		}
+	if (!(*string)) {
+		return (NULL);
 	}
 
 	switch (*string) {
@@ -570,7 +574,7 @@ char *acpi_db_get_next_token(char *string,
 
 		/* Find end of token */
 
-		while (*string && (*string != ' ')) {
+		while (*string && !isspace((int)*string)) {
 			string++;
 		}
 		break;
@@ -740,6 +744,15 @@ acpi_db_command_dispatch(char *input_buffer,
 		if (op) {
 			return (AE_OK);
 		}
+		break;
+
+	case CMD_ALL:
+
+		acpi_os_printf("Executing all objects with NameSeg: %s\n",
+			       acpi_gbl_db_args[1]);
+		acpi_db_execute(acpi_gbl_db_args[1], &acpi_gbl_db_args[2],
+				&acpi_gbl_db_arg_types[2],
+				EX_NO_SINGLE_STEP | EX_ALL);
 		break;
 
 	case CMD_ALLOCATIONS:
@@ -1052,6 +1065,11 @@ acpi_db_command_dispatch(char *input_buffer,
 	case CMD_EVENT:
 
 		acpi_os_printf("Event command not implemented\n");
+		break;
+
+	case CMD_INTERRUPT:
+
+		acpi_db_generate_interrupt(acpi_gbl_db_args[1]);
 		break;
 
 	case CMD_GPE:

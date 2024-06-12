@@ -8,6 +8,7 @@
  */
 
 .text
+#include <linux/export.h>
 #include <linux/threads.h>
 #include <linux/init.h>
 #include <linux/linkage.h>
@@ -23,8 +24,8 @@
 #include <asm/cpufeatures.h>
 #include <asm/percpu.h>
 #include <asm/nops.h>
+#include <asm/nospec-branch.h>
 #include <asm/bootparam.h>
-#include <asm/export.h>
 #include <asm/pgtable_32.h>
 
 /* Physical address */
@@ -42,9 +43,6 @@
 #define X86_CPUID	new_cpu_data+CPUINFO_cpuid_level
 #define X86_CAPABILITY	new_cpu_data+CPUINFO_x86_capability
 #define X86_VENDOR_ID	new_cpu_data+CPUINFO_x86_vendor_id
-
-
-#define SIZEOF_PTREGS 17*4
 
 /*
  * Worst-case size of the kernel mapping we need to make:
@@ -67,11 +65,6 @@ __HEAD
 SYM_CODE_START(startup_32)
 	movl pa(initial_stack),%ecx
 	
-	/* test KEEP_SEGMENTS flag to see if the bootloader is asking
-		us to not reload segments */
-	testb $KEEP_SEGMENTS, BP_loadflags(%esi)
-	jnz 2f
-
 /*
  * Set segments to known values.
  */
@@ -82,7 +75,6 @@ SYM_CODE_START(startup_32)
 	movl %eax,%fs
 	movl %eax,%gs
 	movl %eax,%ss
-2:
 	leal -__PAGE_OFFSET(%ecx),%esp
 
 /*
@@ -123,11 +115,6 @@ SYM_CODE_START(startup_32)
 	movl %eax, pa(olpc_ofw_pgd)
 #endif
 
-#ifdef CONFIG_MICROCODE
-	/* Early load ucode on BSP. */
-	call load_ucode_bsp
-#endif
-
 	/* Create early pagetables. */
 	call  mk_early_pgtbl_32
 
@@ -140,53 +127,8 @@ SYM_CODE_START(startup_32)
 	movl %eax,pa(initial_page_table+0xffc)
 #endif
 
-#ifdef CONFIG_PARAVIRT
-	/* This is can only trip for a broken bootloader... */
-	cmpw $0x207, pa(boot_params + BP_version)
-	jb .Ldefault_entry
-
-	/* Paravirt-compatible boot parameters.  Look to see what architecture
-		we're booting under. */
-	movl pa(boot_params + BP_hardware_subarch), %eax
-	cmpl $num_subarch_entries, %eax
-	jae .Lbad_subarch
-
-	movl pa(subarch_entries)(,%eax,4), %eax
-	subl $__PAGE_OFFSET, %eax
-	jmp *%eax
-
-.Lbad_subarch:
-SYM_INNER_LABEL_ALIGN(xen_entry, SYM_L_WEAK)
-	/* Unknown implementation; there's really
-	   nothing we can do at this point. */
-	ud2a
-
-	__INITDATA
-
-subarch_entries:
-	.long .Ldefault_entry		/* normal x86/PC */
-	.long xen_entry			/* Xen hypervisor */
-	.long .Ldefault_entry		/* Moorestown MID */
-num_subarch_entries = (. - subarch_entries) / 4
-.previous
-#else
 	jmp .Ldefault_entry
-#endif /* CONFIG_PARAVIRT */
 SYM_CODE_END(startup_32)
-
-#ifdef CONFIG_HOTPLUG_CPU
-/*
- * Boot CPU0 entry point. It's called from play_dead(). Everything has been set
- * up already except stack. We just set up stack here. Then call
- * start_secondary().
- */
-SYM_FUNC_START(start_cpu0)
-	movl initial_stack, %ecx
-	movl %ecx, %esp
-	call *(initial_code)
-1:	jmp 1b
-SYM_FUNC_END(start_cpu0)
-#endif
 
 /*
  * Non-boot CPU entry point; entered from trampoline.S
@@ -206,11 +148,6 @@ SYM_FUNC_START(startup_32_smp)
 	movl pa(initial_stack),%ecx
 	movl %eax,%ss
 	leal -__PAGE_OFFSET(%ecx),%esp
-
-#ifdef CONFIG_MICROCODE
-	/* Early load ucode on AP. */
-	call load_ucode_ap
-#endif
 
 .Ldefault_entry:
 	movl $(CR0_STATE & ~X86_CR0_PG),%eax
@@ -297,16 +234,6 @@ SYM_FUNC_START(startup_32_smp)
 	addl $__PAGE_OFFSET, %esp
 
 /*
- * start system 32-bit setup. We need to re-do some of the things done
- * in 16-bit mode for the "real" operations.
- */
-	movl setup_once_ref,%eax
-	andl %eax,%eax
-	jz 1f				# Did we do this already?
-	call *%eax
-1:
-
-/*
  * Check if it is 486
  */
 	movb $4,X86			# at least 486
@@ -355,8 +282,8 @@ SYM_FUNC_START(startup_32_smp)
 	movl $(__KERNEL_PERCPU), %eax
 	movl %eax,%fs			# set this cpu's percpu
 
-	movl $(__KERNEL_STACK_CANARY),%eax
-	movl %eax,%gs
+	xorl %eax,%eax
+	movl %eax,%gs			# clear possible garbage in %gs
 
 	xorl %eax,%eax			# Clear LDT
 	lldt %ax
@@ -367,32 +294,7 @@ SYM_FUNC_END(startup_32_smp)
 
 #include "verify_cpu.S"
 
-/*
- *  setup_once
- *
- *  The setup work we only want to run on the BSP.
- *
- *  Warning: %esi is live across this function.
- */
 __INIT
-setup_once:
-#ifdef CONFIG_STACKPROTECTOR
-	/*
-	 * Configure the stack canary. The linker can't handle this by
-	 * relocation.  Manually set base address in stack canary
-	 * segment descriptor.
-	 */
-	movl $gdt_page,%eax
-	movl $stack_canary,%ecx
-	movw %cx, 8 * GDT_ENTRY_STACK_CANARY + 2(%eax)
-	shrl $16, %ecx
-	movb %cl, 8 * GDT_ENTRY_STACK_CANARY + 4(%eax)
-	movb %ch, 8 * GDT_ENTRY_STACK_CANARY + 7(%eax)
-#endif
-
-	andl $0,setup_once_ref	/* Once is enough, thanks */
-	ret
-
 SYM_FUNC_START(early_idt_handler_array)
 	# 36(%esp) %eflags
 	# 32(%esp) %cs
@@ -483,7 +385,7 @@ SYM_FUNC_START(early_ignore_irq)
 	pushl 32(%esp)
 	pushl 40(%esp)
 	pushl $int_msg
-	call printk
+	call _printk
 
 	call dump_stack
 
@@ -508,9 +410,8 @@ SYM_DATA(early_recursion_flag, .long 0)
 __REFDATA
 	.align 4
 SYM_DATA(initial_code,		.long i386_start_kernel)
-SYM_DATA(setup_once_ref,	.long setup_once)
 
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
+#ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 #define	PGD_ALIGN	(2 * PAGE_SIZE)
 #define PTI_USER_PGD_FILL	1024
 #else
@@ -570,7 +471,7 @@ SYM_DATA_START(initial_page_table)
 # endif
 	.align PAGE_SIZE		/* needs to be page-sized too */
 
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
+#ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 	/*
 	 * PTI needs another page so sync_initial_pagetable() works correctly
 	 * and does not scribble over the data which is placed behind the
@@ -584,19 +485,13 @@ SYM_DATA_END(initial_page_table)
 
 .data
 .balign 4
-/*
- * The SIZEOF_PTREGS gap is a convention which helps the in-kernel unwinder
- * reliably detect the end of the stack.
- */
-SYM_DATA(initial_stack,
-		.long init_thread_union + THREAD_SIZE -
-		SIZEOF_PTREGS - TOP_OF_KERNEL_STACK_PADDING)
+SYM_DATA(initial_stack, .long __top_init_kernel_stack)
 
 __INITRODATA
 int_msg:
 	.asciz "Unknown interrupt or fault at: %p %p %p\n"
 
-#include "../../x86/xen/xen-head.S"
+#include "../xen/xen-head.S"
 
 /*
  * The IDT and GDT 'descriptors' are a strange 48-bit object

@@ -12,7 +12,9 @@
 #include <linux/mod_devicetable.h>
 #include <linux/soundwire/sdw.h>
 #include <linux/soundwire/sdw_type.h>
+#include <linux/soundwire/sdw_registers.h>
 #include <linux/module.h>
+#include <linux/pm_runtime.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
 #include <sound/soc.h>
@@ -109,6 +111,7 @@ static bool rt715_readable_register(struct device *dev, unsigned int reg)
 	case 0x839d:
 	case 0x83a7:
 	case 0x83a9:
+	case 0x752001:
 	case 0x752039:
 		return true;
 	default:
@@ -352,7 +355,7 @@ static const struct regmap_config rt715_regmap = {
 	.max_register = 0x752039, /* Maximum number of register */
 	.reg_defaults = rt715_reg_defaults, /* Defaults */
 	.num_reg_defaults = ARRAY_SIZE(rt715_reg_defaults),
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.use_single_read = true,
 	.use_single_write = true,
 	.reg_read = rt715_sdw_read,
@@ -415,13 +418,11 @@ static int rt715_update_status(struct sdw_slave *slave,
 {
 	struct rt715_priv *rt715 = dev_get_drvdata(&slave->dev);
 
-	/* Update the status */
-	rt715->status = status;
 	/*
 	 * Perform initialization only if slave status is present and
 	 * hw_init flag is false
 	 */
-	if (rt715->hw_init || rt715->status != SDW_SLAVE_ATTACHED)
+	if (rt715->hw_init || status != SDW_SLAVE_ATTACHED)
 		return 0;
 
 	/* perform I/O transfers required for Slave initialization */
@@ -431,10 +432,14 @@ static int rt715_update_status(struct sdw_slave *slave,
 static int rt715_read_prop(struct sdw_slave *slave)
 {
 	struct sdw_slave_prop *prop = &slave->prop;
-	int nval, i, num_of_ports = 1;
+	int nval, i;
 	u32 bit;
 	unsigned long addr;
 	struct sdw_dpn_prop *dpn;
+
+	prop->scp_int1_mask = SDW_SCP_INT1_IMPL_DEF | SDW_SCP_INT1_BUS_CLASH |
+		SDW_SCP_INT1_PARITY;
+	prop->quirks = SDW_SLAVE_QUIRKS_INVALID_INITIAL_PARITY;
 
 	prop->paging_support = false;
 
@@ -443,7 +448,6 @@ static int rt715_read_prop(struct sdw_slave *slave)
 	prop->sink_ports = 0x0;	/* BITMAP:  00000000 */
 
 	nval = hweight32(prop->source_ports);
-	num_of_ports += nval;
 	prop->src_dpn_prop = devm_kcalloc(&slave->dev, nval,
 					sizeof(*prop->src_dpn_prop),
 					GFP_KERNEL);
@@ -459,36 +463,6 @@ static int rt715_read_prop(struct sdw_slave *slave)
 		dpn[i].ch_prep_timeout = 10;
 		i++;
 	}
-
-	/* do this again for sink now */
-	nval = hweight32(prop->sink_ports);
-	num_of_ports += nval;
-	prop->sink_dpn_prop = devm_kcalloc(&slave->dev, nval,
-					sizeof(*prop->sink_dpn_prop),
-					GFP_KERNEL);
-	if (!prop->sink_dpn_prop)
-		return -ENOMEM;
-
-	dpn = prop->sink_dpn_prop;
-	i = 0;
-	addr = prop->sink_ports;
-	for_each_set_bit(bit, &addr, 32) {
-		dpn[i].num = bit;
-		dpn[i].simple_ch_prep_sm = true;
-		dpn[i].ch_prep_timeout = 10;
-		i++;
-	}
-
-	/* Allocate port_ready based on num_of_ports */
-	slave->port_ready = devm_kcalloc(&slave->dev, num_of_ports,
-					sizeof(*slave->port_ready),
-					GFP_KERNEL);
-	if (!slave->port_ready)
-		return -ENOMEM;
-
-	/* Initialize completion */
-	for (i = 0; i < num_of_ports; i++)
-		init_completion(&slave->port_ready[i]);
 
 	/* set the timeout values */
 	prop->clk_stop_timeout = 20;
@@ -509,12 +483,12 @@ static int rt715_bus_config(struct sdw_slave *slave,
 
 	ret = rt715_clock_config(&slave->dev);
 	if (ret < 0)
-		dev_err(&slave->dev, "Invalid clk config");
+		dev_err(&slave->dev, "%s: Invalid clk config", __func__);
 
 	return 0;
 }
 
-static struct sdw_slave_ops rt715_slave_ops = {
+static const struct sdw_slave_ops rt715_slave_ops = {
 	.read_prop = rt715_read_prop,
 	.update_status = rt715_update_status,
 	.bus_config = rt715_bus_config,
@@ -525,26 +499,29 @@ static int rt715_sdw_probe(struct sdw_slave *slave,
 {
 	struct regmap *sdw_regmap, *regmap;
 
-	/* Assign ops */
-	slave->ops = &rt715_slave_ops;
-
 	/* Regmap Initialization */
 	sdw_regmap = devm_regmap_init_sdw(slave, &rt715_sdw_regmap);
-	if (!sdw_regmap)
-		return -EINVAL;
+	if (IS_ERR(sdw_regmap))
+		return PTR_ERR(sdw_regmap);
 
 	regmap = devm_regmap_init(&slave->dev, NULL, &slave->dev,
 		&rt715_regmap);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	rt715_init(&slave->dev, sdw_regmap, regmap, slave);
+	return rt715_init(&slave->dev, sdw_regmap, regmap, slave);
+}
+
+static int rt715_sdw_remove(struct sdw_slave *slave)
+{
+	pm_runtime_disable(&slave->dev);
 
 	return 0;
 }
 
 static const struct sdw_device_id rt715_id[] = {
-	SDW_SLAVE_ENTRY(0x025d, 0x715, 0),
+	SDW_SLAVE_ENTRY_EXT(0x025d, 0x714, 0x2, 0, 0),
+	SDW_SLAVE_ENTRY_EXT(0x025d, 0x715, 0x2, 0, 0),
 	{},
 };
 MODULE_DEVICE_TABLE(sdw, rt715_id);
@@ -561,7 +538,7 @@ static int __maybe_unused rt715_dev_suspend(struct device *dev)
 	return 0;
 }
 
-#define RT715_PROBE_TIMEOUT 2000
+#define RT715_PROBE_TIMEOUT 5000
 
 static int __maybe_unused rt715_dev_resume(struct device *dev)
 {
@@ -569,7 +546,7 @@ static int __maybe_unused rt715_dev_resume(struct device *dev)
 	struct rt715_priv *rt715 = dev_get_drvdata(dev);
 	unsigned long time;
 
-	if (!rt715->hw_init)
+	if (!rt715->first_hw_init)
 		return 0;
 
 	if (!slave->unattach_request)
@@ -578,7 +555,9 @@ static int __maybe_unused rt715_dev_resume(struct device *dev)
 	time = wait_for_completion_timeout(&slave->initialization_complete,
 					   msecs_to_jiffies(RT715_PROBE_TIMEOUT));
 	if (!time) {
-		dev_err(&slave->dev, "Initialization not complete, timed out\n");
+		dev_err(&slave->dev, "%s: Initialization not complete, timed out\n", __func__);
+		sdw_show_ping_status(slave->bus, true);
+
 		return -ETIMEDOUT;
 	}
 
@@ -599,10 +578,10 @@ static const struct dev_pm_ops rt715_pm = {
 static struct sdw_driver rt715_sdw_driver = {
 	.driver = {
 		   .name = "rt715",
-		   .owner = THIS_MODULE,
 		   .pm = &rt715_pm,
 		   },
 	.probe = rt715_sdw_probe,
+	.remove = rt715_sdw_remove,
 	.ops = &rt715_slave_ops,
 	.id_table = rt715_id,
 };

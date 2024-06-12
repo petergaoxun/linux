@@ -1,7 +1,7 @@
 /*
  * pbias-regulator.c
  *
- * Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com/
+ * Copyright (C) 2014 Texas Instruments Incorporated - https://www.ti.com/
  * Author: Balaji T K <balajitk@ti.com>
  *
  * This program is free software; you can redistribute it and/or
@@ -25,7 +25,6 @@
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 
 struct pbias_reg_info {
 	u32 enable;
@@ -231,6 +230,7 @@ static struct platform_driver pbias_regulator_driver = {
 	.probe		= pbias_regulator_probe,
 	.driver		= {
 		.name		= "pbias-regulator",
+		.probe_type	= PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table = of_match_ptr(pbias_of_match),
 	},
 };

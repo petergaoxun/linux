@@ -12,14 +12,21 @@ maintainers:
 properties:
   compatible:
     enum:
-      - "samsung,s5pv210-rotator"
-      - "samsung,exynos4210-rotator"
-      - "samsung,exynos4212-rotator"
-      - "samsung,exynos5250-rotator"
+      - samsung,s5pv210-rotator
+      - samsung,exynos4210-rotator
+      - samsung,exynos4212-rotator
+      - samsung,exynos5250-rotator
+
   reg:
     maxItems: 1
 
   interrupts:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
     maxItems: 1
 
   clocks:
@@ -36,6 +43,8 @@ required:
   - clocks
   - clock-names
 
+additionalProperties: false
+
 examples:
   - |
     rotator@12810000 {
@@ -45,4 +54,3 @@ examples:
         clocks = <&clock 278>;
         clock-names = "rotator";
     };
-

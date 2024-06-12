@@ -7,8 +7,8 @@
  * This handles calls from both 32bit and 64bit mode.
  *
  * Lock order:
- *	contex.ldt_usr_sem
- *	  mmap_sem
+ *	context.ldt_usr_sem
+ *	  mmap_lock
  *	    context.lock
  */
 
@@ -27,8 +27,9 @@
 #include <asm/tlb.h>
 #include <asm/desc.h>
 #include <asm/mmu_context.h>
-#include <asm/syscalls.h>
 #include <asm/pgtable_areas.h>
+
+#include <xen/xen.h>
 
 /* This is a multiple of PAGE_SIZE. */
 #define LDT_SLOT_STRIDE (LDT_ENTRIES * LDT_ENTRY_SIZE)
@@ -48,7 +49,7 @@ void load_mm_ldt(struct mm_struct *mm)
 	/*
 	 * Any change to mm->context.ldt is followed by an IPI to all
 	 * CPUs with the mm active.  The LDT will not be freed until
-	 * after the IPI is handled by all such CPUs.  This means that,
+	 * after the IPI is handled by all such CPUs.  This means that
 	 * if the ldt_struct changes before we return, the values we see
 	 * will be safe, and the new values will be loaded before we run
 	 * any user code.
@@ -153,7 +154,7 @@ static struct ldt_struct *alloc_ldt_struct(unsigned int num_entries)
 	if (num_entries > LDT_ENTRIES)
 		return NULL;
 
-	new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL);
+	new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL_ACCOUNT);
 	if (!new_ldt)
 		return NULL;
 
@@ -167,9 +168,9 @@ static struct ldt_struct *alloc_ldt_struct(unsigned int num_entries)
 	 * than PAGE_SIZE.
 	 */
 	if (alloc_size > PAGE_SIZE)
-		new_ldt->entries = vzalloc(alloc_size);
+		new_ldt->entries = __vmalloc(alloc_size, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	else
-		new_ldt->entries = (void *)get_zeroed_page(GFP_KERNEL);
+		new_ldt->entries = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
 
 	if (!new_ldt->entries) {
 		kfree(new_ldt);
@@ -183,7 +184,7 @@ static struct ldt_struct *alloc_ldt_struct(unsigned int num_entries)
 	return new_ldt;
 }
 
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
+#ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 
 static void do_sanity_check(struct mm_struct *mm,
 			    bool had_kernel_mapping,
@@ -366,15 +367,17 @@ static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
 
 		va = (unsigned long)ldt_slot_va(ldt->slot) + offset;
 		ptep = get_locked_pte(mm, va, &ptl);
-		pte_clear(mm, va, ptep);
-		pte_unmap_unlock(ptep, ptl);
+		if (!WARN_ON_ONCE(!ptep)) {
+			pte_clear(mm, va, ptep);
+			pte_unmap_unlock(ptep, ptl);
+		}
 	}
 
 	va = (unsigned long)ldt_slot_va(ldt->slot);
 	flush_tlb_mm_range(mm, va, va + nr_pages * PAGE_SIZE, PAGE_SHIFT, false);
 }
 
-#else /* !CONFIG_PAGE_TABLE_ISOLATION */
+#else /* !CONFIG_MITIGATION_PAGE_TABLE_ISOLATION */
 
 static int
 map_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt, int slot)
@@ -385,11 +388,11 @@ map_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt, int slot)
 static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
 {
 }
-#endif /* CONFIG_PAGE_TABLE_ISOLATION */
+#endif /* CONFIG_MITIGATION_PAGE_TABLE_ISOLATION */
 
 static void free_ldt_pgtables(struct mm_struct *mm)
 {
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
+#ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 	struct mmu_gather tlb;
 	unsigned long start = LDT_BASE_ADDR;
 	unsigned long end = LDT_END_ADDR;
@@ -397,9 +400,15 @@ static void free_ldt_pgtables(struct mm_struct *mm)
 	if (!boot_cpu_has(X86_FEATURE_PTI))
 		return;
 
-	tlb_gather_mmu(&tlb, mm, start, end);
+	/*
+	 * Although free_pgd_range() is intended for freeing user
+	 * page-tables, it also works out for kernel mappings on x86.
+	 * We use tlb_gather_mmu_fullmm() to avoid confusing the
+	 * range-tracking logic in __tlb_adjust_range().
+	 */
+	tlb_gather_mmu_fullmm(&tlb, mm);
 	free_pgd_range(&tlb, start, end, start, end);
-	tlb_finish_mmu(&tlb, start, end);
+	tlb_finish_mmu(&tlb);
 #endif
 }
 
@@ -544,6 +553,28 @@ static int read_default_ldt(void __user *ptr, unsigned long bytecount)
 	return bytecount;
 }
 
+static bool allow_16bit_segments(void)
+{
+	if (!IS_ENABLED(CONFIG_X86_16BIT))
+		return false;
+
+#ifdef CONFIG_XEN_PV
+	/*
+	 * Xen PV does not implement ESPFIX64, which means that 16-bit
+	 * segments will not work correctly.  Until either Xen PV implements
+	 * ESPFIX64 and can signal this fact to the guest or unless someone
+	 * provides compelling evidence that allowing broken 16-bit segments
+	 * is worthwhile, disallow 16-bit segments under Xen PV.
+	 */
+	if (xen_pv_domain()) {
+		pr_info_once("Warning: 16-bit segments do not work correctly in a Xen PV guest\n");
+		return false;
+	}
+#endif
+
+	return true;
+}
+
 static int write_ldt(void __user *ptr, unsigned long bytecount, int oldmode)
 {
 	struct mm_struct *mm = current->mm;
@@ -575,7 +606,7 @@ static int write_ldt(void __user *ptr, unsigned long bytecount, int oldmode)
 		/* The user wants to clear the entry. */
 		memset(&ldt, 0, sizeof(ldt));
 	} else {
-		if (!IS_ENABLED(CONFIG_X86_16BIT) && !ldt_info.seg_32bit) {
+		if (!ldt_info.seg_32bit && !allow_16bit_segments()) {
 			error = -EINVAL;
 			goto out;
 		}
@@ -654,7 +685,7 @@ SYSCALL_DEFINE3(modify_ldt, int , func , void __user * , ptr ,
 	}
 	/*
 	 * The SYSCALL_DEFINE() macros give us an 'unsigned long'
-	 * return type, but tht ABI for sys_modify_ldt() expects
+	 * return type, but the ABI for sys_modify_ldt() expects
 	 * 'int'.  This cast gives us an int-sized value in %rax
 	 * for the return code.  The 'unsigned' is necessary so
 	 * the compiler does not try to sign-extend the negative

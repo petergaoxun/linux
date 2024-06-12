@@ -11,81 +11,86 @@
 
 #include <kunit/assert.h>
 #include <kunit/try-catch.h>
-#include <linux/kernel.h>
+
+#include <linux/args.h>
+#include <linux/compiler.h>
+#include <linux/container_of.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/jump_label.h>
+#include <linux/kconfig.h>
+#include <linux/kref.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
-struct kunit_resource;
+#include <asm/rwonce.h>
 
-typedef int (*kunit_resource_init_t)(struct kunit_resource *, void *);
-typedef void (*kunit_resource_free_t)(struct kunit_resource *);
-
-/**
- * struct kunit_resource - represents a *test managed resource*
- * @allocation: for the user to store arbitrary data.
- * @free: a user supplied function to free the resource. Populated by
- * kunit_alloc_resource().
- *
- * Represents a *test managed resource*, a resource which will automatically be
- * cleaned up at the end of a test case.
- *
- * Example:
- *
- * .. code-block:: c
- *
- *	struct kunit_kmalloc_params {
- *		size_t size;
- *		gfp_t gfp;
- *	};
- *
- *	static int kunit_kmalloc_init(struct kunit_resource *res, void *context)
- *	{
- *		struct kunit_kmalloc_params *params = context;
- *		res->allocation = kmalloc(params->size, params->gfp);
- *
- *		if (!res->allocation)
- *			return -ENOMEM;
- *
- *		return 0;
- *	}
- *
- *	static void kunit_kmalloc_free(struct kunit_resource *res)
- *	{
- *		kfree(res->allocation);
- *	}
- *
- *	void *kunit_kmalloc(struct kunit *test, size_t size, gfp_t gfp)
- *	{
- *		struct kunit_kmalloc_params params;
- *		struct kunit_resource *res;
- *
- *		params.size = size;
- *		params.gfp = gfp;
- *
- *		res = kunit_alloc_resource(test, kunit_kmalloc_init,
- *			kunit_kmalloc_free, &params);
- *		if (res)
- *			return res->allocation;
- *
- *		return NULL;
- *	}
- */
-struct kunit_resource {
-	void *allocation;
-	kunit_resource_free_t free;
-
-	/* private: internal use only. */
-	struct list_head node;
-};
+/* Static key: true if any KUnit tests are currently running */
+DECLARE_STATIC_KEY_FALSE(kunit_running);
 
 struct kunit;
+struct string_stream;
+
+/* Maximum size of parameter description string. */
+#define KUNIT_PARAM_DESC_SIZE 128
+
+/* Maximum size of a status comment. */
+#define KUNIT_STATUS_COMMENT_SIZE 256
+
+/*
+ * TAP specifies subtest stream indentation of 4 spaces, 8 spaces for a
+ * sub-subtest.  See the "Subtests" section in
+ * https://node-tap.org/tap-protocol/
+ */
+#define KUNIT_INDENT_LEN		4
+#define KUNIT_SUBTEST_INDENT		"    "
+#define KUNIT_SUBSUBTEST_INDENT		"        "
+
+/**
+ * enum kunit_status - Type of result for a test or test suite
+ * @KUNIT_SUCCESS: Denotes the test suite has not failed nor been skipped
+ * @KUNIT_FAILURE: Denotes the test has failed.
+ * @KUNIT_SKIPPED: Denotes the test has been skipped.
+ */
+enum kunit_status {
+	KUNIT_SUCCESS,
+	KUNIT_FAILURE,
+	KUNIT_SKIPPED,
+};
+
+/* Attribute struct/enum definitions */
+
+/*
+ * Speed Attribute is stored as an enum and separated into categories of
+ * speed: very_slowm, slow, and normal. These speeds are relative to
+ * other KUnit tests.
+ *
+ * Note: unset speed attribute acts as default of KUNIT_SPEED_NORMAL.
+ */
+enum kunit_speed {
+	KUNIT_SPEED_UNSET,
+	KUNIT_SPEED_VERY_SLOW,
+	KUNIT_SPEED_SLOW,
+	KUNIT_SPEED_NORMAL,
+	KUNIT_SPEED_MAX = KUNIT_SPEED_NORMAL,
+};
+
+/* Holds attributes for each test case and suite */
+struct kunit_attributes {
+	enum kunit_speed speed;
+};
 
 /**
  * struct kunit_case - represents an individual test case.
  *
  * @run_case: the function representing the actual test case.
  * @name:     the name of the test case.
+ * @generate_params: the generator function for parameterized tests.
+ * @attr:     the attributes associated with the test
  *
  * A test case is a function with the signature,
  * ``void (*)(struct kunit *)``
@@ -120,10 +125,26 @@ struct kunit;
 struct kunit_case {
 	void (*run_case)(struct kunit *test);
 	const char *name;
+	const void* (*generate_params)(const void *prev, char *desc);
+	struct kunit_attributes attr;
 
 	/* private: internal use only. */
-	bool success;
+	enum kunit_status status;
+	char *module_name;
+	struct string_stream *log;
 };
+
+static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
+{
+	switch (status) {
+	case KUNIT_SKIPPED:
+	case KUNIT_SUCCESS:
+		return "ok";
+	case KUNIT_FAILURE:
+		return "not ok";
+	}
+	return "invalid";
+}
 
 /**
  * KUNIT_CASE - A helper for creating a &struct kunit_case
@@ -134,29 +155,111 @@ struct kunit_case {
  * &struct kunit_case object from it. See the documentation for
  * &struct kunit_case for an example on how to use it.
  */
-#define KUNIT_CASE(test_name) { .run_case = test_name, .name = #test_name }
+#define KUNIT_CASE(test_name)			\
+		{ .run_case = test_name, .name = #test_name,	\
+		  .module_name = KBUILD_MODNAME}
+
+/**
+ * KUNIT_CASE_ATTR - A helper for creating a &struct kunit_case
+ * with attributes
+ *
+ * @test_name: a reference to a test case function.
+ * @attributes: a reference to a struct kunit_attributes object containing
+ * test attributes
+ */
+#define KUNIT_CASE_ATTR(test_name, attributes)			\
+		{ .run_case = test_name, .name = #test_name,	\
+		  .attr = attributes, .module_name = KBUILD_MODNAME}
+
+/**
+ * KUNIT_CASE_SLOW - A helper for creating a &struct kunit_case
+ * with the slow attribute
+ *
+ * @test_name: a reference to a test case function.
+ */
+
+#define KUNIT_CASE_SLOW(test_name)			\
+		{ .run_case = test_name, .name = #test_name,	\
+		  .attr.speed = KUNIT_SPEED_SLOW, .module_name = KBUILD_MODNAME}
+
+/**
+ * KUNIT_CASE_PARAM - A helper for creation a parameterized &struct kunit_case
+ *
+ * @test_name: a reference to a test case function.
+ * @gen_params: a reference to a parameter generator function.
+ *
+ * The generator function::
+ *
+ *	const void* gen_params(const void *prev, char *desc)
+ *
+ * is used to lazily generate a series of arbitrarily typed values that fit into
+ * a void*. The argument @prev is the previously returned value, which should be
+ * used to derive the next value; @prev is set to NULL on the initial generator
+ * call. When no more values are available, the generator must return NULL.
+ * Optionally write a string into @desc (size of KUNIT_PARAM_DESC_SIZE)
+ * describing the parameter.
+ */
+#define KUNIT_CASE_PARAM(test_name, gen_params)			\
+		{ .run_case = test_name, .name = #test_name,	\
+		  .generate_params = gen_params, .module_name = KBUILD_MODNAME}
+
+/**
+ * KUNIT_CASE_PARAM_ATTR - A helper for creating a parameterized &struct
+ * kunit_case with attributes
+ *
+ * @test_name: a reference to a test case function.
+ * @gen_params: a reference to a parameter generator function.
+ * @attributes: a reference to a struct kunit_attributes object containing
+ * test attributes
+ */
+#define KUNIT_CASE_PARAM_ATTR(test_name, gen_params, attributes)	\
+		{ .run_case = test_name, .name = #test_name,	\
+		  .generate_params = gen_params,				\
+		  .attr = attributes, .module_name = KBUILD_MODNAME}
 
 /**
  * struct kunit_suite - describes a related collection of &struct kunit_case
  *
  * @name:	the name of the test. Purely informational.
+ * @suite_init:	called once per test suite before the test cases.
+ * @suite_exit:	called once per test suite after all test cases.
  * @init:	called before every test case.
  * @exit:	called after every test case.
  * @test_cases:	a null terminated array of test cases.
+ * @attr:	the attributes associated with the test suite
  *
  * A kunit_suite is a collection of related &struct kunit_case s, such that
  * @init is called before every test case and @exit is called after every
  * test case, similar to the notion of a *test fixture* or a *test class*
  * in other unit testing frameworks like JUnit or Googletest.
  *
+ * Note that @exit and @suite_exit will run even if @init or @suite_init
+ * fail: make sure they can handle any inconsistent state which may result.
+ *
  * Every &struct kunit_case must be associated with a kunit_suite for KUnit
  * to run it.
  */
 struct kunit_suite {
 	const char name[256];
+	int (*suite_init)(struct kunit_suite *suite);
+	void (*suite_exit)(struct kunit_suite *suite);
 	int (*init)(struct kunit *test);
 	void (*exit)(struct kunit *test);
 	struct kunit_case *test_cases;
+	struct kunit_attributes attr;
+
+	/* private: internal use only */
+	char status_comment[KUNIT_STATUS_COMMENT_SIZE];
+	struct dentry *debugfs;
+	struct string_stream *log;
+	int suite_init_err;
+	bool is_init;
+};
+
+/* Stores an array of suites, end points one past the end */
+struct kunit_suite_set {
+	struct kunit_suite * const *start;
+	struct kunit_suite * const *end;
 };
 
 /**
@@ -175,7 +278,12 @@ struct kunit {
 
 	/* private: internal use only. */
 	const char *name; /* Read only after initialization! */
+	struct string_stream *log; /* Points at case log after initialization */
 	struct kunit_try_catch try_catch;
+	/* param_value is the current parameter value for a test case. */
+	const void *param_value;
+	/* param_index stores the index of the parameter in parameterized tests. */
+	int param_index;
 	/*
 	 * success starts as true, and may only be set to false during a
 	 * test case; thus, it is safe to update this across multiple
@@ -183,144 +291,144 @@ struct kunit {
 	 * be read after the test case finishes once all threads associated
 	 * with the test case have terminated.
 	 */
-	bool success; /* Read only after test_case finishes! */
 	spinlock_t lock; /* Guards all mutable test state. */
+	enum kunit_status status; /* Read only after test_case finishes! */
 	/*
 	 * Because resources is a list that may be updated multiple times (with
 	 * new resources) from any thread associated with a test case, we must
 	 * protect it with some type of lock.
 	 */
 	struct list_head resources; /* Protected by lock. */
+
+	char status_comment[KUNIT_STATUS_COMMENT_SIZE];
+	/* Saves the last seen test. Useful to help with faults. */
+	struct kunit_loc last_seen;
 };
 
-void kunit_init_test(struct kunit *test, const char *name);
+static inline void kunit_set_failure(struct kunit *test)
+{
+	WRITE_ONCE(test->status, KUNIT_FAILURE);
+}
+
+bool kunit_enabled(void);
+const char *kunit_action(void);
+const char *kunit_filter_glob(void);
+char *kunit_filter(void);
+char *kunit_filter_action(void);
+
+void kunit_init_test(struct kunit *test, const char *name, struct string_stream *log);
 
 int kunit_run_tests(struct kunit_suite *suite);
+
+size_t kunit_suite_num_test_cases(struct kunit_suite *suite);
+
+unsigned int kunit_test_case_num(struct kunit_suite *suite,
+				 struct kunit_case *test_case);
+
+struct kunit_suite_set
+kunit_filter_suites(const struct kunit_suite_set *suite_set,
+		    const char *filter_glob,
+		    char *filters,
+		    char *filter_action,
+		    int *err);
+void kunit_free_suite_set(struct kunit_suite_set suite_set);
+
+int __kunit_test_suites_init(struct kunit_suite * const * const suites, int num_suites);
+
+void __kunit_test_suites_exit(struct kunit_suite **suites, int num_suites);
+
+void kunit_exec_run_tests(struct kunit_suite_set *suite_set, bool builtin);
+void kunit_exec_list_tests(struct kunit_suite_set *suite_set, bool include_attr);
+
+struct kunit_suite_set kunit_merge_suite_sets(struct kunit_suite_set init_suite_set,
+		struct kunit_suite_set suite_set);
+
+#if IS_BUILTIN(CONFIG_KUNIT)
+int kunit_run_all_tests(void);
+#else
+static inline int kunit_run_all_tests(void)
+{
+	return 0;
+}
+#endif /* IS_BUILTIN(CONFIG_KUNIT) */
+
+#define __kunit_test_suites(unique_array, ...)				       \
+	static struct kunit_suite *unique_array[]			       \
+	__aligned(sizeof(struct kunit_suite *))				       \
+	__used __section(".kunit_test_suites") = { __VA_ARGS__ }
 
 /**
  * kunit_test_suites() - used to register one or more &struct kunit_suite
  *			 with KUnit.
  *
- * @suites: a statically allocated list of &struct kunit_suite.
+ * @__suites: a statically allocated list of &struct kunit_suite.
  *
- * Registers @suites with the test framework. See &struct kunit_suite for
- * more information.
+ * Registers @suites with the test framework.
+ * This is done by placing the array of struct kunit_suite * in the
+ * .kunit_test_suites ELF section.
  *
- * When builtin,  KUnit tests are all run as late_initcalls; this means
- * that they cannot test anything where tests must run at a different init
- * phase. One significant restriction resulting from this is that KUnit
- * cannot reliably test anything that is initialize in the late_init phase;
- * another is that KUnit is useless to test things that need to be run in
- * an earlier init phase.
+ * When builtin, KUnit tests are all run via the executor at boot, and when
+ * built as a module, they run on module load.
  *
- * An alternative is to build the tests as a module.  Because modules
- * do not support multiple late_initcall()s, we need to initialize an
- * array of suites for a module.
- *
- * TODO(brendanhiggins@google.com): Don't run all KUnit tests as
- * late_initcalls.  I have some future work planned to dispatch all KUnit
- * tests from the same place, and at the very least to do so after
- * everything else is definitely initialized.
  */
-#define kunit_test_suites(...)						\
-	static struct kunit_suite *suites[] = { __VA_ARGS__, NULL};	\
-	static int kunit_test_suites_init(void)				\
-	{								\
-		unsigned int i;						\
-		for (i = 0; suites[i] != NULL; i++)			\
-			kunit_run_tests(suites[i]);			\
-		return 0;						\
-	}								\
-	late_initcall(kunit_test_suites_init);				\
-	static void __exit kunit_test_suites_exit(void)			\
-	{								\
-		return;							\
-	}								\
-	module_exit(kunit_test_suites_exit)
+#define kunit_test_suites(__suites...)						\
+	__kunit_test_suites(__UNIQUE_ID(array),				\
+			    ##__suites)
 
 #define kunit_test_suite(suite)	kunit_test_suites(&suite)
 
-/*
- * Like kunit_alloc_resource() below, but returns the struct kunit_resource
- * object that contains the allocation. This is mostly for testing purposes.
- */
-struct kunit_resource *kunit_alloc_and_get_resource(struct kunit *test,
-						    kunit_resource_init_t init,
-						    kunit_resource_free_t free,
-						    gfp_t internal_gfp,
-						    void *context);
+#define __kunit_init_test_suites(unique_array, ...)			       \
+	static struct kunit_suite *unique_array[]			       \
+	__aligned(sizeof(struct kunit_suite *))				       \
+	__used __section(".kunit_init_test_suites") = { __VA_ARGS__ }
 
 /**
- * kunit_alloc_resource() - Allocates a *test managed resource*.
+ * kunit_test_init_section_suites() - used to register one or more &struct
+ *				      kunit_suite containing init functions or
+ *				      init data.
+ *
+ * @__suites: a statically allocated list of &struct kunit_suite.
+ *
+ * This functions similar to kunit_test_suites() except that it compiles the
+ * list of suites during init phase.
+ *
+ * This macro also suffixes the array and suite declarations it makes with
+ * _probe; so that modpost suppresses warnings about referencing init data
+ * for symbols named in this manner.
+ *
+ * Note: these init tests are not able to be run after boot so there is no
+ * "run" debugfs file generated for these tests.
+ *
+ * Also, do not mark the suite or test case structs with __initdata because
+ * they will be used after the init phase with debugfs.
+ */
+#define kunit_test_init_section_suites(__suites...)			\
+	__kunit_init_test_suites(CONCATENATE(__UNIQUE_ID(array), _probe), \
+			    ##__suites)
+
+#define kunit_test_init_section_suite(suite)	\
+	kunit_test_init_section_suites(&suite)
+
+#define kunit_suite_for_each_test_case(suite, test_case)		\
+	for (test_case = suite->test_cases; test_case->run_case; test_case++)
+
+enum kunit_status kunit_suite_has_succeeded(struct kunit_suite *suite);
+
+/**
+ * kunit_kmalloc_array() - Like kmalloc_array() except the allocation is *test managed*.
  * @test: The test context object.
- * @init: a user supplied function to initialize the resource.
- * @free: a user supplied function to free the resource.
- * @internal_gfp: gfp to use for internal allocations, if unsure, use GFP_KERNEL
- * @context: for the user to pass in arbitrary data to the init function.
+ * @n: number of elements.
+ * @size: The size in bytes of the desired memory.
+ * @gfp: flags passed to underlying kmalloc().
  *
- * Allocates a *test managed resource*, a resource which will automatically be
- * cleaned up at the end of a test case. See &struct kunit_resource for an
- * example.
+ * Just like `kmalloc_array(...)`, except the allocation is managed by the test case
+ * and is automatically cleaned up after the test case concludes. See kunit_add_action()
+ * for more information.
  *
- * NOTE: KUnit needs to allocate memory for each kunit_resource object. You must
- * specify an @internal_gfp that is compatible with the use context of your
- * resource.
+ * Note that some internal context data is also allocated with GFP_KERNEL,
+ * regardless of the gfp passed in.
  */
-static inline void *kunit_alloc_resource(struct kunit *test,
-					 kunit_resource_init_t init,
-					 kunit_resource_free_t free,
-					 gfp_t internal_gfp,
-					 void *context)
-{
-	struct kunit_resource *res;
-
-	res = kunit_alloc_and_get_resource(test, init, free, internal_gfp,
-					   context);
-
-	if (res)
-		return res->allocation;
-
-	return NULL;
-}
-
-typedef bool (*kunit_resource_match_t)(struct kunit *test,
-				       const void *res,
-				       void *match_data);
-
-/**
- * kunit_resource_instance_match() - Match a resource with the same instance.
- * @test: Test case to which the resource belongs.
- * @res: The data stored in kunit_resource->allocation.
- * @match_data: The resource pointer to match against.
- *
- * An instance of kunit_resource_match_t that matches a resource whose
- * allocation matches @match_data.
- */
-static inline bool kunit_resource_instance_match(struct kunit *test,
-						 const void *res,
-						 void *match_data)
-{
-	return res == match_data;
-}
-
-/**
- * kunit_resource_destroy() - Find a kunit_resource and destroy it.
- * @test: Test case to which the resource belongs.
- * @match: Match function. Returns whether a given resource matches @match_data.
- * @free: Must match free on the kunit_resource to free.
- * @match_data: Data passed into @match.
- *
- * Free the latest kunit_resource of @test for which @free matches the
- * kunit_resource_free_t associated with the resource and for which @match
- * returns true.
- *
- * RETURNS:
- * 0 if kunit_resource is found and freed, -ENOENT if not found.
- */
-int kunit_resource_destroy(struct kunit *test,
-			   kunit_resource_match_t match,
-			   kunit_resource_free_t free,
-			   void *match_data);
+void *kunit_kmalloc_array(struct kunit *test, size_t n, size_t size, gfp_t gfp);
 
 /**
  * kunit_kmalloc() - Like kmalloc() except the allocation is *test managed*.
@@ -328,11 +436,15 @@ int kunit_resource_destroy(struct kunit *test,
  * @size: The size in bytes of the desired memory.
  * @gfp: flags passed to underlying kmalloc().
  *
- * Just like `kmalloc(...)`, except the allocation is managed by the test case
- * and is automatically cleaned up after the test case concludes. See &struct
- * kunit_resource for more information.
+ * See kmalloc() and kunit_kmalloc_array() for more information.
+ *
+ * Note that some internal context data is also allocated with GFP_KERNEL,
+ * regardless of the gfp passed in.
  */
-void *kunit_kmalloc(struct kunit *test, size_t size, gfp_t gfp);
+static inline void *kunit_kmalloc(struct kunit *test, size_t size, gfp_t gfp)
+{
+	return kunit_kmalloc_array(test, 1, size, gfp);
+}
 
 /**
  * kunit_kfree() - Like kfree except for allocations managed by KUnit.
@@ -347,17 +459,81 @@ void kunit_kfree(struct kunit *test, const void *ptr);
  * @size: The size in bytes of the desired memory.
  * @gfp: flags passed to underlying kmalloc().
  *
- * See kzalloc() and kunit_kmalloc() for more information.
+ * See kzalloc() and kunit_kmalloc_array() for more information.
  */
 static inline void *kunit_kzalloc(struct kunit *test, size_t size, gfp_t gfp)
 {
 	return kunit_kmalloc(test, size, gfp | __GFP_ZERO);
 }
 
+/**
+ * kunit_kcalloc() - Just like kunit_kmalloc_array(), but zeroes the allocation.
+ * @test: The test context object.
+ * @n: number of elements.
+ * @size: The size in bytes of the desired memory.
+ * @gfp: flags passed to underlying kmalloc().
+ *
+ * See kcalloc() and kunit_kmalloc_array() for more information.
+ */
+static inline void *kunit_kcalloc(struct kunit *test, size_t n, size_t size, gfp_t gfp)
+{
+	return kunit_kmalloc_array(test, n, size, gfp | __GFP_ZERO);
+}
+
 void kunit_cleanup(struct kunit *test);
 
-#define kunit_printk(lvl, test, fmt, ...) \
-	printk(lvl "\t# %s: " fmt, (test)->name, ##__VA_ARGS__)
+void __printf(2, 3) kunit_log_append(struct string_stream *log, const char *fmt, ...);
+
+/**
+ * kunit_mark_skipped() - Marks @test_or_suite as skipped
+ *
+ * @test_or_suite: The test context object.
+ * @fmt:  A printk() style format string.
+ *
+ * Marks the test as skipped. @fmt is given output as the test status
+ * comment, typically the reason the test was skipped.
+ *
+ * Test execution continues after kunit_mark_skipped() is called.
+ */
+#define kunit_mark_skipped(test_or_suite, fmt, ...)			\
+	do {								\
+		WRITE_ONCE((test_or_suite)->status, KUNIT_SKIPPED);	\
+		scnprintf((test_or_suite)->status_comment,		\
+			  KUNIT_STATUS_COMMENT_SIZE,			\
+			  fmt, ##__VA_ARGS__);				\
+	} while (0)
+
+/**
+ * kunit_skip() - Marks @test_or_suite as skipped
+ *
+ * @test_or_suite: The test context object.
+ * @fmt:  A printk() style format string.
+ *
+ * Skips the test. @fmt is given output as the test status
+ * comment, typically the reason the test was skipped.
+ *
+ * Test execution is halted after kunit_skip() is called.
+ */
+#define kunit_skip(test_or_suite, fmt, ...)				\
+	do {								\
+		kunit_mark_skipped((test_or_suite), fmt, ##__VA_ARGS__);\
+		kunit_try_catch_throw(&((test_or_suite)->try_catch));	\
+	} while (0)
+
+/*
+ * printk and log to per-test or per-suite log buffer.  Logging only done
+ * if CONFIG_KUNIT_DEBUGFS is 'y'; if it is 'n', no log is allocated/used.
+ */
+#define kunit_log(lvl, test_or_suite, fmt, ...)				\
+	do {								\
+		printk(lvl fmt, ##__VA_ARGS__);				\
+		kunit_log_append((test_or_suite)->log,	fmt,		\
+				 ##__VA_ARGS__);			\
+	} while (0)
+
+#define kunit_printk(lvl, test, fmt, ...)				\
+	kunit_log(lvl, test, KUNIT_SUBTEST_INDENT "# %s: " fmt,		\
+		  (test)->name,	##__VA_ARGS__)
 
 /**
  * kunit_info() - Prints an INFO level message associated with @test.
@@ -393,6 +569,15 @@ void kunit_cleanup(struct kunit *test);
 #define kunit_err(test, fmt, ...) \
 	kunit_printk(KERN_ERR, test, fmt, ##__VA_ARGS__)
 
+/*
+ * Must be called at the beginning of each KUNIT_*_ASSERTION().
+ * Cf. KUNIT_CURRENT_LOC.
+ */
+#define _KUNIT_SAVE_LOC(test) do {					       \
+	WRITE_ONCE(test->last_seen.file, __FILE__);			       \
+	WRITE_ONCE(test->last_seen.line, __LINE__);			       \
+} while (0)
+
 /**
  * KUNIT_SUCCEED() - A no-op expectation. Only exists for code clarity.
  * @test: The test context object.
@@ -401,30 +586,42 @@ void kunit_cleanup(struct kunit *test);
  * words, it does nothing and only exists for code clarity. See
  * KUNIT_EXPECT_TRUE() for more information.
  */
-#define KUNIT_SUCCEED(test) do {} while (0)
+#define KUNIT_SUCCEED(test) _KUNIT_SAVE_LOC(test)
 
-void kunit_do_assertion(struct kunit *test,
-			struct kunit_assert *assert,
-			bool pass,
-			const char *fmt, ...);
+void __noreturn __kunit_abort(struct kunit *test);
 
-#define KUNIT_ASSERTION(test, pass, assert_class, INITIALIZER, fmt, ...) do {  \
-	struct assert_class __assertion = INITIALIZER;			       \
-	kunit_do_assertion(test,					       \
-			   &__assertion.assert,				       \
-			   pass,					       \
-			   fmt,						       \
-			   ##__VA_ARGS__);				       \
+void __printf(6, 7) __kunit_do_failed_assertion(struct kunit *test,
+						const struct kunit_loc *loc,
+						enum kunit_assert_type type,
+						const struct kunit_assert *assert,
+						assert_format_t assert_format,
+						const char *fmt, ...);
+
+#define _KUNIT_FAILED(test, assert_type, assert_class, assert_format, INITIALIZER, fmt, ...) do { \
+	static const struct kunit_loc __loc = KUNIT_CURRENT_LOC;	       \
+	const struct assert_class __assertion = INITIALIZER;		       \
+	__kunit_do_failed_assertion(test,				       \
+				    &__loc,				       \
+				    assert_type,			       \
+				    &__assertion.assert,		       \
+				    assert_format,			       \
+				    fmt,				       \
+				    ##__VA_ARGS__);			       \
+	if (assert_type == KUNIT_ASSERTION)				       \
+		__kunit_abort(test);					       \
 } while (0)
 
 
-#define KUNIT_FAIL_ASSERTION(test, assert_type, fmt, ...)		       \
-	KUNIT_ASSERTION(test,						       \
-			false,						       \
-			kunit_fail_assert,				       \
-			KUNIT_INIT_FAIL_ASSERT_STRUCT(test, assert_type),      \
-			fmt,						       \
-			##__VA_ARGS__)
+#define KUNIT_FAIL_ASSERTION(test, assert_type, fmt, ...) do {		       \
+	_KUNIT_SAVE_LOC(test);						       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      kunit_fail_assert,				       \
+		      kunit_fail_assert_format,				       \
+		      {},						       \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
+} while (0)
 
 /**
  * KUNIT_FAIL() - Always causes a test to fail when evaluated.
@@ -443,21 +640,29 @@ void kunit_do_assertion(struct kunit *test,
 			     fmt,					       \
 			     ##__VA_ARGS__)
 
+/* Helper to safely pass around an initializer list to other macros. */
+#define KUNIT_INIT_ASSERT(initializers...) { initializers }
+
 #define KUNIT_UNARY_ASSERTION(test,					       \
 			      assert_type,				       \
-			      condition,				       \
-			      expected_true,				       \
+			      condition_,				       \
+			      expected_true_,				       \
 			      fmt,					       \
 			      ...)					       \
-	KUNIT_ASSERTION(test,						       \
-			!!(condition) == !!expected_true,		       \
-			kunit_unary_assert,				       \
-			KUNIT_INIT_UNARY_ASSERT_STRUCT(test,		       \
-						       assert_type,	       \
-						       #condition,	       \
-						       expected_true),	       \
-			fmt,						       \
-			##__VA_ARGS__)
+do {									       \
+	_KUNIT_SAVE_LOC(test);						       \
+	if (likely(!!(condition_) == !!expected_true_))			       \
+		break;							       \
+									       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      kunit_unary_assert,				       \
+		      kunit_unary_assert_format,			       \
+		      KUNIT_INIT_ASSERT(.condition = #condition_,	       \
+					.expected_true = expected_true_),      \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
+} while (0)
 
 #define KUNIT_TRUE_MSG_ASSERTION(test, assert_type, condition, fmt, ...)       \
 	KUNIT_UNARY_ASSERTION(test,					       \
@@ -467,9 +672,6 @@ void kunit_do_assertion(struct kunit *test,
 			      fmt,					       \
 			      ##__VA_ARGS__)
 
-#define KUNIT_TRUE_ASSERTION(test, assert_type, condition) \
-	KUNIT_TRUE_MSG_ASSERTION(test, assert_type, condition, NULL)
-
 #define KUNIT_FALSE_MSG_ASSERTION(test, assert_type, condition, fmt, ...)      \
 	KUNIT_UNARY_ASSERTION(test,					       \
 			      assert_type,				       \
@@ -477,9 +679,6 @@ void kunit_do_assertion(struct kunit *test,
 			      false,					       \
 			      fmt,					       \
 			      ##__VA_ARGS__)
-
-#define KUNIT_FALSE_ASSERTION(test, assert_type, condition) \
-	KUNIT_FALSE_MSG_ASSERTION(test, assert_type, condition, NULL)
 
 /*
  * A factory macro for defining the assertions and expectations for the basic
@@ -497,7 +696,7 @@ void kunit_do_assertion(struct kunit *test,
  */
 #define KUNIT_BASE_BINARY_ASSERTION(test,				       \
 				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
+				    format_func,			       \
 				    assert_type,			       \
 				    left,				       \
 				    op,					       \
@@ -505,353 +704,58 @@ void kunit_do_assertion(struct kunit *test,
 				    fmt,				       \
 				    ...)				       \
 do {									       \
-	typeof(left) __left = (left);					       \
-	typeof(right) __right = (right);				       \
-	((void)__typecheck(__left, __right));				       \
+	const typeof(left) __left = (left);				       \
+	const typeof(right) __right = (right);				       \
+	static const struct kunit_binary_assert_text __text = {		       \
+		.operation = #op,					       \
+		.left_text = #left,					       \
+		.right_text = #right,					       \
+	};								       \
 									       \
-	KUNIT_ASSERTION(test,						       \
-			__left op __right,				       \
-			assert_class,					       \
-			ASSERT_CLASS_INIT(test,				       \
-					  assert_type,			       \
-					  #op,				       \
-					  #left,			       \
-					  __left,			       \
-					  #right,			       \
-					  __right),			       \
-			fmt,						       \
-			##__VA_ARGS__);					       \
+	_KUNIT_SAVE_LOC(test);						       \
+	if (likely(__left op __right))					       \
+		break;							       \
+									       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      assert_class,					       \
+		      format_func,					       \
+		      KUNIT_INIT_ASSERT(.text = &__text,		       \
+					.left_value = __left,		       \
+					.right_value = __right),	       \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
 } while (0)
 
-#define KUNIT_BASE_EQ_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
+#define KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   assert_type,				       \
+				   left,				       \
+				   op,					       \
+				   right,				       \
+				   fmt,					       \
 				    ...)				       \
 	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
+				    kunit_binary_assert,		       \
+				    kunit_binary_assert_format,		       \
 				    assert_type,			       \
-				    left, ==, right,			       \
+				    left, op, right,			       \
 				    fmt,				       \
 				    ##__VA_ARGS__)
 
-#define KUNIT_BASE_NE_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
+#define KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   assert_type,				       \
+				   left,				       \
+				   op,					       \
+				   right,				       \
+				   fmt,					       \
 				    ...)				       \
 	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left, !=, right,			       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BASE_LT_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ...)				       \
-	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left, <, right,			       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BASE_LE_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ...)				       \
-	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left, <=, right,			       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BASE_GT_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ...)				       \
-	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left, >, right,			       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BASE_GE_MSG_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ...)				       \
-	KUNIT_BASE_BINARY_ASSERTION(test,				       \
-				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
-				    assert_type,			       \
-				    left, >=, right,			       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_EQ_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_EQ_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_EQ_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_EQ_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_EQ_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_EQ_MSG_ASSERTION(test,				       \
 				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
+				    kunit_binary_ptr_assert_format,	       \
 				    assert_type,			       \
-				    left,				       \
-				    right,				       \
+				    left, op, right,			       \
 				    fmt,				       \
 				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_EQ_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_EQ_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_NE_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_NE_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_NE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_NE_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_NE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_NE_MSG_ASSERTION(test,				       \
-				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_NE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_NE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_LT_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_LT_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_LT_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_LT_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_LT_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_LT_MSG_ASSERTION(test,				       \
-				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_LT_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_LT_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_LE_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_LE_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_LE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_LE_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_LE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_LE_MSG_ASSERTION(test,				       \
-				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_LE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_LE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_GT_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_GT_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_GT_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_GT_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_GT_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_GT_MSG_ASSERTION(test,				       \
-				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_GT_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_GT_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_GE_MSG_ASSERTION(test, assert_type, left, right, fmt, ...)\
-	KUNIT_BASE_GE_MSG_ASSERTION(test,				       \
-				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_GE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_GE_MSG_ASSERTION(test,				       \
-				      assert_type,			       \
-				      left,				       \
-				      right,				       \
-				      NULL)
-
-#define KUNIT_BINARY_PTR_GE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BASE_GE_MSG_ASSERTION(test,				       \
-				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
-				    assert_type,			       \
-				    left,				       \
-				    right,				       \
-				    fmt,				       \
-				    ##__VA_ARGS__)
-
-#define KUNIT_BINARY_PTR_GE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_PTR_GE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
 
 #define KUNIT_BINARY_STR_ASSERTION(test,				       \
 				   assert_type,				       \
@@ -861,60 +765,64 @@ do {									       \
 				   fmt,					       \
 				   ...)					       \
 do {									       \
-	typeof(left) __left = (left);					       \
-	typeof(right) __right = (right);				       \
+	const char *__left = (left);					       \
+	const char *__right = (right);					       \
+	static const struct kunit_binary_assert_text __text = {		       \
+		.operation = #op,					       \
+		.left_text = #left,					       \
+		.right_text = #right,					       \
+	};								       \
 									       \
-	KUNIT_ASSERTION(test,						       \
-			strcmp(__left, __right) op 0,			       \
-			kunit_binary_str_assert,			       \
-			KUNIT_INIT_BINARY_ASSERT_STRUCT(test,		       \
-							assert_type,	       \
-							#op,		       \
-							#left,		       \
-							__left,		       \
-							#right,		       \
-							__right),	       \
-			fmt,						       \
-			##__VA_ARGS__);					       \
+	_KUNIT_SAVE_LOC(test);						       \
+	if (likely((__left) && (__right) && (strcmp(__left, __right) op 0)))   \
+		break;							       \
+									       \
+									       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      kunit_binary_str_assert,				       \
+		      kunit_binary_str_assert_format,			       \
+		      KUNIT_INIT_ASSERT(.text = &__text,		       \
+					.left_value = __left,		       \
+					.right_value = __right),	       \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
 } while (0)
 
-#define KUNIT_BINARY_STR_EQ_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BINARY_STR_ASSERTION(test,				       \
-				   assert_type,				       \
-				   left, ==, right,			       \
-				   fmt,					       \
-				   ##__VA_ARGS__)
-
-#define KUNIT_BINARY_STR_EQ_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_STR_EQ_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
-
-#define KUNIT_BINARY_STR_NE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ...)				       \
-	KUNIT_BINARY_STR_ASSERTION(test,				       \
-				   assert_type,				       \
-				   left, !=, right,			       \
-				   fmt,					       \
-				   ##__VA_ARGS__)
-
-#define KUNIT_BINARY_STR_NE_ASSERTION(test, assert_type, left, right)	       \
-	KUNIT_BINARY_STR_NE_MSG_ASSERTION(test,				       \
-					  assert_type,			       \
-					  left,				       \
-					  right,			       \
-					  NULL)
+#define KUNIT_MEM_ASSERTION(test,					       \
+			    assert_type,				       \
+			    left,					       \
+			    op,						       \
+			    right,					       \
+			    size_,					       \
+			    fmt,					       \
+			    ...)					       \
+do {									       \
+	const void *__left = (left);					       \
+	const void *__right = (right);					       \
+	const size_t __size = (size_);					       \
+	static const struct kunit_binary_assert_text __text = {		       \
+		.operation = #op,					       \
+		.left_text = #left,					       \
+		.right_text = #right,					       \
+	};								       \
+									       \
+	_KUNIT_SAVE_LOC(test);						       \
+	if (likely(__left && __right))					       \
+		if (likely(memcmp(__left, __right, __size) op 0))	       \
+			break;						       \
+									       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      kunit_mem_assert,					       \
+		      kunit_mem_assert_format,				       \
+		      KUNIT_INIT_ASSERT(.text = &__text,		       \
+					.left_value = __left,		       \
+					.right_value = __right,		       \
+					.size = __size),		       \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
+} while (0)
 
 #define KUNIT_PTR_NOT_ERR_OR_NULL_MSG_ASSERTION(test,			       \
 						assert_type,		       \
@@ -922,24 +830,20 @@ do {									       \
 						fmt,			       \
 						...)			       \
 do {									       \
-	typeof(ptr) __ptr = (ptr);					       \
+	const typeof(ptr) __ptr = (ptr);				       \
 									       \
-	KUNIT_ASSERTION(test,						       \
-			!IS_ERR_OR_NULL(__ptr),				       \
-			kunit_ptr_not_err_assert,			       \
-			KUNIT_INIT_PTR_NOT_ERR_STRUCT(test,		       \
-						      assert_type,	       \
-						      #ptr,		       \
-						      __ptr),		       \
-			fmt,						       \
-			##__VA_ARGS__);					       \
+	_KUNIT_SAVE_LOC(test);						       \
+	if (!IS_ERR_OR_NULL(__ptr))					       \
+		break;							       \
+									       \
+	_KUNIT_FAILED(test,						       \
+		      assert_type,					       \
+		      kunit_ptr_not_err_assert,				       \
+		      kunit_ptr_not_err_assert_format,			       \
+		      KUNIT_INIT_ASSERT(.text = #ptr, .value = __ptr),	       \
+		      fmt,						       \
+		      ##__VA_ARGS__);					       \
 } while (0)
-
-#define KUNIT_PTR_NOT_ERR_OR_NULL_ASSERTION(test, assert_type, ptr)	       \
-	KUNIT_PTR_NOT_ERR_OR_NULL_MSG_ASSERTION(test,			       \
-						assert_type,		       \
-						ptr,			       \
-						NULL)
 
 /**
  * KUNIT_EXPECT_TRUE() - Causes a test failure when the expression is not true.
@@ -953,7 +857,7 @@ do {									       \
  * *expectation failure*.
  */
 #define KUNIT_EXPECT_TRUE(test, condition) \
-	KUNIT_TRUE_ASSERTION(test, KUNIT_EXPECTATION, condition)
+	KUNIT_EXPECT_TRUE_MSG(test, condition, NULL)
 
 #define KUNIT_EXPECT_TRUE_MSG(test, condition, fmt, ...)		       \
 	KUNIT_TRUE_MSG_ASSERTION(test,					       \
@@ -972,7 +876,7 @@ do {									       \
  * KUNIT_EXPECT_TRUE() for more information.
  */
 #define KUNIT_EXPECT_FALSE(test, condition) \
-	KUNIT_FALSE_ASSERTION(test, KUNIT_EXPECTATION, condition)
+	KUNIT_EXPECT_FALSE_MSG(test, condition, NULL)
 
 #define KUNIT_EXPECT_FALSE_MSG(test, condition, fmt, ...)		       \
 	KUNIT_FALSE_MSG_ASSERTION(test,					       \
@@ -993,15 +897,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_EQ(test, left, right) \
-	KUNIT_BINARY_EQ_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_EQ_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_EQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_EQ_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_PTR_EQ() - Expects that pointers @left and @right are equal.
@@ -1015,18 +918,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_PTR_EQ(test, left, right)				       \
-	KUNIT_BINARY_PTR_EQ_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right)
+	KUNIT_EXPECT_PTR_EQ_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_PTR_EQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_PTR_EQ_MSG_ASSERTION(test,				       \
-					  KUNIT_EXPECTATION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_NE() - An expectation that @left and @right are not equal.
@@ -1040,15 +939,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_NE(test, left, right) \
-	KUNIT_BINARY_NE_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_NE_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_NE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_NE_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_PTR_NE() - Expects that pointers @left and @right are not equal.
@@ -1062,18 +960,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_PTR_NE(test, left, right)				       \
-	KUNIT_BINARY_PTR_NE_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right)
+	KUNIT_EXPECT_PTR_NE_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_PTR_NE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_PTR_NE_MSG_ASSERTION(test,				       \
-					  KUNIT_EXPECTATION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_LT() - An expectation that @left is less than @right.
@@ -1087,15 +981,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_LT(test, left, right) \
-	KUNIT_BINARY_LT_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_LT_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_LT_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_LT_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, <, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_LE() - Expects that @left is less than or equal to @right.
@@ -1109,15 +1002,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_LE(test, left, right) \
-	KUNIT_BINARY_LE_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_LE_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_LE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_LE_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, <=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_GT() - An expectation that @left is greater than @right.
@@ -1131,15 +1023,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_GT(test, left, right) \
-	KUNIT_BINARY_GT_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_GT_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_GT_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_GT_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, >, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_GE() - Expects that @left is greater than or equal to @right.
@@ -1153,15 +1044,14 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_GE(test, left, right) \
-	KUNIT_BINARY_GE_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_GE_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_GE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_GE_MSG_ASSERTION(test,				       \
-				      KUNIT_EXPECTATION,		       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, >=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_STREQ() - Expects that strings @left and @right are equal.
@@ -1175,15 +1065,14 @@ do {									       \
  * for more information.
  */
 #define KUNIT_EXPECT_STREQ(test, left, right) \
-	KUNIT_BINARY_STR_EQ_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_STREQ_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_STREQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_STR_EQ_MSG_ASSERTION(test,				       \
-					  KUNIT_EXPECTATION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_STR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_STRNEQ() - Expects that strings @left and @right are not equal.
@@ -1197,15 +1086,110 @@ do {									       \
  * for more information.
  */
 #define KUNIT_EXPECT_STRNEQ(test, left, right) \
-	KUNIT_BINARY_STR_NE_ASSERTION(test, KUNIT_EXPECTATION, left, right)
+	KUNIT_EXPECT_STRNEQ_MSG(test, left, right, NULL)
 
 #define KUNIT_EXPECT_STRNEQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_STR_NE_MSG_ASSERTION(test,				       \
-					  KUNIT_EXPECTATION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_STR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
+
+/**
+ * KUNIT_EXPECT_MEMEQ() - Expects that the first @size bytes of @left and @right are equal.
+ * @test: The test context object.
+ * @left: An arbitrary expression that evaluates to the specified size.
+ * @right: An arbitrary expression that evaluates to the specified size.
+ * @size: Number of bytes compared.
+ *
+ * Sets an expectation that the values that @left and @right evaluate to are
+ * equal. This is semantically equivalent to
+ * KUNIT_EXPECT_TRUE(@test, !memcmp((@left), (@right), (@size))). See
+ * KUNIT_EXPECT_TRUE() for more information.
+ *
+ * Although this expectation works for any memory block, it is not recommended
+ * for comparing more structured data, such as structs. This expectation is
+ * recommended for comparing, for example, data arrays.
+ */
+#define KUNIT_EXPECT_MEMEQ(test, left, right, size) \
+	KUNIT_EXPECT_MEMEQ_MSG(test, left, right, size, NULL)
+
+#define KUNIT_EXPECT_MEMEQ_MSG(test, left, right, size, fmt, ...)	       \
+	KUNIT_MEM_ASSERTION(test,					       \
+			    KUNIT_EXPECTATION,				       \
+			    left, ==, right,				       \
+			    size,					       \
+			    fmt,					       \
+			    ##__VA_ARGS__)
+
+/**
+ * KUNIT_EXPECT_MEMNEQ() - Expects that the first @size bytes of @left and @right are not equal.
+ * @test: The test context object.
+ * @left: An arbitrary expression that evaluates to the specified size.
+ * @right: An arbitrary expression that evaluates to the specified size.
+ * @size: Number of bytes compared.
+ *
+ * Sets an expectation that the values that @left and @right evaluate to are
+ * not equal. This is semantically equivalent to
+ * KUNIT_EXPECT_TRUE(@test, memcmp((@left), (@right), (@size))). See
+ * KUNIT_EXPECT_TRUE() for more information.
+ *
+ * Although this expectation works for any memory block, it is not recommended
+ * for comparing more structured data, such as structs. This expectation is
+ * recommended for comparing, for example, data arrays.
+ */
+#define KUNIT_EXPECT_MEMNEQ(test, left, right, size) \
+	KUNIT_EXPECT_MEMNEQ_MSG(test, left, right, size, NULL)
+
+#define KUNIT_EXPECT_MEMNEQ_MSG(test, left, right, size, fmt, ...)	       \
+	KUNIT_MEM_ASSERTION(test,					       \
+			    KUNIT_EXPECTATION,				       \
+			    left, !=, right,				       \
+			    size,					       \
+			    fmt,					       \
+			    ##__VA_ARGS__)
+
+/**
+ * KUNIT_EXPECT_NULL() - Expects that @ptr is null.
+ * @test: The test context object.
+ * @ptr: an arbitrary pointer.
+ *
+ * Sets an expectation that the value that @ptr evaluates to is null. This is
+ * semantically equivalent to KUNIT_EXPECT_PTR_EQ(@test, ptr, NULL).
+ * See KUNIT_EXPECT_TRUE() for more information.
+ */
+#define KUNIT_EXPECT_NULL(test, ptr)				               \
+	KUNIT_EXPECT_NULL_MSG(test,					       \
+			      ptr,					       \
+			      NULL)
+
+#define KUNIT_EXPECT_NULL_MSG(test, ptr, fmt, ...)	                       \
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   ptr, ==, NULL,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
+
+/**
+ * KUNIT_EXPECT_NOT_NULL() - Expects that @ptr is not null.
+ * @test: The test context object.
+ * @ptr: an arbitrary pointer.
+ *
+ * Sets an expectation that the value that @ptr evaluates to is not null. This
+ * is semantically equivalent to KUNIT_EXPECT_PTR_NE(@test, ptr, NULL).
+ * See KUNIT_EXPECT_TRUE() for more information.
+ */
+#define KUNIT_EXPECT_NOT_NULL(test, ptr)			               \
+	KUNIT_EXPECT_NOT_NULL_MSG(test,					       \
+				  ptr,					       \
+				  NULL)
+
+#define KUNIT_EXPECT_NOT_NULL_MSG(test, ptr, fmt, ...)	                       \
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_EXPECTATION,			       \
+				   ptr, !=, NULL,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_EXPECT_NOT_ERR_OR_NULL() - Expects that @ptr is not null and not err.
@@ -1218,7 +1202,7 @@ do {									       \
  * more information.
  */
 #define KUNIT_EXPECT_NOT_ERR_OR_NULL(test, ptr) \
-	KUNIT_PTR_NOT_ERR_OR_NULL_ASSERTION(test, KUNIT_EXPECTATION, ptr)
+	KUNIT_EXPECT_NOT_ERR_OR_NULL_MSG(test, ptr, NULL)
 
 #define KUNIT_EXPECT_NOT_ERR_OR_NULL_MSG(test, ptr, fmt, ...)		       \
 	KUNIT_PTR_NOT_ERR_OR_NULL_MSG_ASSERTION(test,			       \
@@ -1242,7 +1226,7 @@ do {									       \
  * this is otherwise known as an *assertion failure*.
  */
 #define KUNIT_ASSERT_TRUE(test, condition) \
-	KUNIT_TRUE_ASSERTION(test, KUNIT_ASSERTION, condition)
+	KUNIT_ASSERT_TRUE_MSG(test, condition, NULL)
 
 #define KUNIT_ASSERT_TRUE_MSG(test, condition, fmt, ...)		       \
 	KUNIT_TRUE_MSG_ASSERTION(test,					       \
@@ -1261,7 +1245,7 @@ do {									       \
  * (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_FALSE(test, condition) \
-	KUNIT_FALSE_ASSERTION(test, KUNIT_ASSERTION, condition)
+	KUNIT_ASSERT_FALSE_MSG(test, condition, NULL)
 
 #define KUNIT_ASSERT_FALSE_MSG(test, condition, fmt, ...)		       \
 	KUNIT_FALSE_MSG_ASSERTION(test,					       \
@@ -1281,15 +1265,14 @@ do {									       \
  * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_EQ(test, left, right) \
-	KUNIT_BINARY_EQ_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_EQ_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_EQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_EQ_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_PTR_EQ() - Asserts that pointers @left and @right are equal.
@@ -1302,15 +1285,14 @@ do {									       \
  * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_PTR_EQ(test, left, right) \
-	KUNIT_BINARY_PTR_EQ_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_PTR_EQ_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_PTR_EQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_PTR_EQ_MSG_ASSERTION(test,				       \
-					  KUNIT_ASSERTION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_NE() - An assertion that @left and @right are not equal.
@@ -1323,15 +1305,14 @@ do {									       \
  * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_NE(test, left, right) \
-	KUNIT_BINARY_NE_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_NE_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_NE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_NE_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_PTR_NE() - Asserts that pointers @left and @right are not equal.
@@ -1345,15 +1326,14 @@ do {									       \
  * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_PTR_NE(test, left, right) \
-	KUNIT_BINARY_PTR_NE_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_PTR_NE_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_PTR_NE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_PTR_NE_MSG_ASSERTION(test,				       \
-					  KUNIT_ASSERTION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 /**
  * KUNIT_ASSERT_LT() - An assertion that @left is less than @right.
  * @test: The test context object.
@@ -1366,15 +1346,14 @@ do {									       \
  * is not met.
  */
 #define KUNIT_ASSERT_LT(test, left, right) \
-	KUNIT_BINARY_LT_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_LT_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_LT_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_LT_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, <, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 /**
  * KUNIT_ASSERT_LE() - An assertion that @left is less than or equal to @right.
  * @test: The test context object.
@@ -1387,15 +1366,14 @@ do {									       \
  * KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_LE(test, left, right) \
-	KUNIT_BINARY_LE_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_LE_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_LE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_LE_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, <=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_GT() - An assertion that @left is greater than @right.
@@ -1409,15 +1387,14 @@ do {									       \
  * is not met.
  */
 #define KUNIT_ASSERT_GT(test, left, right) \
-	KUNIT_BINARY_GT_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_GT_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_GT_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_GT_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, >, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_GE() - Assertion that @left is greater than or equal to @right.
@@ -1431,15 +1408,14 @@ do {									       \
  * is not met.
  */
 #define KUNIT_ASSERT_GE(test, left, right) \
-	KUNIT_BINARY_GE_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_GE_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_GE_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_GE_MSG_ASSERTION(test,				       \
-				      KUNIT_ASSERTION,			       \
-				      left,				       \
-				      right,				       \
-				      fmt,				       \
-				      ##__VA_ARGS__)
+	KUNIT_BINARY_INT_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, >=, right,			       \
+				   fmt,					       \
+				    ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_STREQ() - An assertion that strings @left and @right are equal.
@@ -1452,15 +1428,14 @@ do {									       \
  * assertion failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_STREQ(test, left, right) \
-	KUNIT_BINARY_STR_EQ_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_STREQ_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_STREQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_STR_EQ_MSG_ASSERTION(test,				       \
-					  KUNIT_ASSERTION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_STR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, ==, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_STRNEQ() - Expects that strings @left and @right are not equal.
@@ -1474,15 +1449,56 @@ do {									       \
  * for more information.
  */
 #define KUNIT_ASSERT_STRNEQ(test, left, right) \
-	KUNIT_BINARY_STR_NE_ASSERTION(test, KUNIT_ASSERTION, left, right)
+	KUNIT_ASSERT_STRNEQ_MSG(test, left, right, NULL)
 
 #define KUNIT_ASSERT_STRNEQ_MSG(test, left, right, fmt, ...)		       \
-	KUNIT_BINARY_STR_NE_MSG_ASSERTION(test,				       \
-					  KUNIT_ASSERTION,		       \
-					  left,				       \
-					  right,			       \
-					  fmt,				       \
-					  ##__VA_ARGS__)
+	KUNIT_BINARY_STR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   left, !=, right,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
+
+/**
+ * KUNIT_ASSERT_NULL() - Asserts that pointers @ptr is null.
+ * @test: The test context object.
+ * @ptr: an arbitrary pointer.
+ *
+ * Sets an assertion that the values that @ptr evaluates to is null. This is
+ * the same as KUNIT_EXPECT_NULL(), except it causes an assertion
+ * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
+ */
+#define KUNIT_ASSERT_NULL(test, ptr) \
+	KUNIT_ASSERT_NULL_MSG(test,					       \
+			      ptr,					       \
+			      NULL)
+
+#define KUNIT_ASSERT_NULL_MSG(test, ptr, fmt, ...) \
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   ptr, ==, NULL,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
+
+/**
+ * KUNIT_ASSERT_NOT_NULL() - Asserts that pointers @ptr is not null.
+ * @test: The test context object.
+ * @ptr: an arbitrary pointer.
+ *
+ * Sets an assertion that the values that @ptr evaluates to is not null. This
+ * is the same as KUNIT_EXPECT_NOT_NULL(), except it causes an assertion
+ * failure (see KUNIT_ASSERT_TRUE()) when the assertion is not met.
+ */
+#define KUNIT_ASSERT_NOT_NULL(test, ptr) \
+	KUNIT_ASSERT_NOT_NULL_MSG(test,					       \
+				  ptr,					       \
+				  NULL)
+
+#define KUNIT_ASSERT_NOT_NULL_MSG(test, ptr, fmt, ...) \
+	KUNIT_BINARY_PTR_ASSERTION(test,				       \
+				   KUNIT_ASSERTION,			       \
+				   ptr, !=, NULL,			       \
+				   fmt,					       \
+				   ##__VA_ARGS__)
 
 /**
  * KUNIT_ASSERT_NOT_ERR_OR_NULL() - Assertion that @ptr is not null and not err.
@@ -1495,7 +1511,7 @@ do {									       \
  * KUNIT_ASSERT_TRUE()) when the assertion is not met.
  */
 #define KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr) \
-	KUNIT_PTR_NOT_ERR_OR_NULL_ASSERTION(test, KUNIT_ASSERTION, ptr)
+	KUNIT_ASSERT_NOT_ERR_OR_NULL_MSG(test, ptr, NULL)
 
 #define KUNIT_ASSERT_NOT_ERR_OR_NULL_MSG(test, ptr, fmt, ...)		       \
 	KUNIT_PTR_NOT_ERR_OR_NULL_MSG_ASSERTION(test,			       \
@@ -1503,5 +1519,49 @@ do {									       \
 						ptr,			       \
 						fmt,			       \
 						##__VA_ARGS__)
+
+/**
+ * KUNIT_ARRAY_PARAM() - Define test parameter generator from an array.
+ * @name:  prefix for the test parameter generator function.
+ * @array: array of test parameters.
+ * @get_desc: function to convert param to description; NULL to use default
+ *
+ * Define function @name_gen_params which uses @array to generate parameters.
+ */
+#define KUNIT_ARRAY_PARAM(name, array, get_desc)						\
+	static const void *name##_gen_params(const void *prev, char *desc)			\
+	{											\
+		typeof((array)[0]) *__next = prev ? ((typeof(__next)) prev) + 1 : (array);	\
+		if (__next - (array) < ARRAY_SIZE((array))) {					\
+			void (*__get_desc)(typeof(__next), char *) = get_desc;			\
+			if (__get_desc)								\
+				__get_desc(__next, desc);					\
+			return __next;								\
+		}										\
+		return NULL;									\
+	}
+
+/**
+ * KUNIT_ARRAY_PARAM_DESC() - Define test parameter generator from an array.
+ * @name:  prefix for the test parameter generator function.
+ * @array: array of test parameters.
+ * @desc_member: structure member from array element to use as description
+ *
+ * Define function @name_gen_params which uses @array to generate parameters.
+ */
+#define KUNIT_ARRAY_PARAM_DESC(name, array, desc_member)					\
+	static const void *name##_gen_params(const void *prev, char *desc)			\
+	{											\
+		typeof((array)[0]) *__next = prev ? ((typeof(__next)) prev) + 1 : (array);	\
+		if (__next - (array) < ARRAY_SIZE((array))) {					\
+			strscpy(desc, __next->desc_member, KUNIT_PARAM_DESC_SIZE);		\
+			return __next;								\
+		}										\
+		return NULL;									\
+	}
+
+// TODO(dlatypov@google.com): consider eventually migrating users to explicitly
+// include resource.h themselves if they need it.
+#include <kunit/resource.h>
 
 #endif /* _KUNIT_TEST_H */

@@ -25,16 +25,20 @@
 #include <nvif/if0008.h>
 
 void
-nvif_mmu_fini(struct nvif_mmu *mmu)
+nvif_mmu_dtor(struct nvif_mmu *mmu)
 {
+	if (!nvif_object_constructed(&mmu->object))
+		return;
+
 	kfree(mmu->kind);
 	kfree(mmu->type);
 	kfree(mmu->heap);
-	nvif_object_fini(&mmu->object);
+	nvif_object_dtor(&mmu->object);
 }
 
 int
-nvif_mmu_init(struct nvif_object *parent, s32 oclass, struct nvif_mmu *mmu)
+nvif_mmu_ctor(struct nvif_object *parent, const char *name, s32 oclass,
+	      struct nvif_mmu *mmu)
 {
 	static const struct nvif_mclass mems[] = {
 		{ NVIF_CLASS_MEM_GF100, -1 },
@@ -50,8 +54,8 @@ nvif_mmu_init(struct nvif_object *parent, s32 oclass, struct nvif_mmu *mmu)
 	mmu->type = NULL;
 	mmu->kind = NULL;
 
-	ret = nvif_object_init(parent, 0, oclass, &args, sizeof(args),
-			       &mmu->object);
+	ret = nvif_object_ctor(parent, name ? name : "nvifMmu", 0, oclass,
+			       &args, sizeof(args), &mmu->object);
 	if (ret)
 		goto done;
 
@@ -127,6 +131,6 @@ nvif_mmu_init(struct nvif_object *parent, s32 oclass, struct nvif_mmu *mmu)
 
 done:
 	if (ret)
-		nvif_mmu_fini(mmu);
+		nvif_mmu_dtor(mmu);
 	return ret;
 }

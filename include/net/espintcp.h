@@ -25,13 +25,14 @@ struct espintcp_ctx {
 	struct espintcp_msg partial;
 	void (*saved_data_ready)(struct sock *sk);
 	void (*saved_write_space)(struct sock *sk);
+	void (*saved_destruct)(struct sock *sk);
 	struct work_struct work;
 	bool tx_running;
 };
 
 static inline struct espintcp_ctx *espintcp_getctx(const struct sock *sk)
 {
-	struct inet_connection_sock *icsk = inet_csk(sk);
+	const struct inet_connection_sock *icsk = inet_csk(sk);
 
 	/* RCU is only needed for diag */
 	return (__force void *)icsk->icsk_ulp_data;

@@ -3,41 +3,41 @@
 #include <linux/uaccess.h>
 #include <linux/kernel.h>
 
-#ifdef CONFIG_X86_64
-static __always_inline u64 canonical_address(u64 vaddr, u8 vaddr_bits)
-{
-	return ((s64)vaddr << (64 - vaddr_bits)) >> (64 - vaddr_bits);
-}
+#include <asm/vsyscall.h>
 
-static __always_inline bool invalid_probe_range(u64 vaddr)
+#ifdef CONFIG_X86_64
+bool copy_from_kernel_nofault_allowed(const void *unsafe_src, size_t size)
 {
+	unsigned long vaddr = (unsigned long)unsafe_src;
+
 	/*
-	 * Range covering the highest possible canonical userspace address
-	 * as well as non-canonical address range. For the canonical range
-	 * we also need to include the userspace guard page.
+	 * Do not allow userspace addresses.  This disallows
+	 * normal userspace and the userspace guard page:
 	 */
-	return vaddr < TASK_SIZE_MAX + PAGE_SIZE ||
-	       canonical_address(vaddr, boot_cpu_data.x86_virt_bits) != vaddr;
+	if (vaddr < TASK_SIZE_MAX + PAGE_SIZE)
+		return false;
+
+	/*
+	 * Reading from the vsyscall page may cause an unhandled fault in
+	 * certain cases.  Though it is at an address above TASK_SIZE_MAX, it is
+	 * usually considered as a user space address.
+	 */
+	if (is_vsyscall_vaddr(vaddr))
+		return false;
+
+	/*
+	 * Allow everything during early boot before 'x86_virt_bits'
+	 * is initialized.  Needed for instruction decoding in early
+	 * exception handlers.
+	 */
+	if (!boot_cpu_data.x86_virt_bits)
+		return true;
+
+	return __is_canonical_address(vaddr, boot_cpu_data.x86_virt_bits);
 }
 #else
-static __always_inline bool invalid_probe_range(u64 vaddr)
+bool copy_from_kernel_nofault_allowed(const void *unsafe_src, size_t size)
 {
-	return vaddr < TASK_SIZE_MAX;
+	return (unsigned long)unsafe_src >= TASK_SIZE_MAX;
 }
 #endif
-
-long probe_kernel_read_strict(void *dst, const void *src, size_t size)
-{
-	if (unlikely(invalid_probe_range((unsigned long)src)))
-		return -EFAULT;
-
-	return __probe_kernel_read(dst, src, size);
-}
-
-long strncpy_from_unsafe_strict(char *dst, const void *unsafe_addr, long count)
-{
-	if (unlikely(invalid_probe_range((unsigned long)unsafe_addr)))
-		return -EFAULT;
-
-	return __strncpy_from_unsafe(dst, unsafe_addr, count);
-}

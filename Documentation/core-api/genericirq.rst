@@ -264,7 +264,7 @@ The following control flow is implemented (simplified excerpt)::
             desc->irq_data.chip->irq_unmask();
         desc->status &= ~pending;
         handle_irq_event(desc->action);
-    } while (status & pending);
+    } while (desc->status & pending);
     desc->status &= ~running;
 
 
@@ -419,6 +419,7 @@ functions which are exported.
 .. kernel-doc:: kernel/irq/manage.c
 
 .. kernel-doc:: kernel/irq/chip.c
+   :export:
 
 Internal Functions Provided
 ===========================
@@ -431,6 +432,7 @@ functions.
 .. kernel-doc:: kernel/irq/handle.c
 
 .. kernel-doc:: kernel/irq/chip.c
+   :internal:
 
 Credits
 =======

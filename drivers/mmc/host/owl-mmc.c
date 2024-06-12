@@ -16,8 +16,9 @@
 #include <linux/interrupt.h>
 #include <linux/mmc/host.h>
 #include <linux/mmc/slot-gpio.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
-#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
 
@@ -92,6 +93,8 @@
 #define OWL_SD_STATE_RC16ER		BIT(1)
 #define OWL_SD_STATE_CRC7ER		BIT(0)
 
+#define OWL_CMD_TIMEOUT_MS		30000
+
 struct owl_mmc_host {
 	struct device *dev;
 	struct reset_control *reset;
@@ -132,10 +135,9 @@ static void owl_mmc_update_reg(void __iomem *reg, unsigned int val, bool state)
 static irqreturn_t owl_irq_handler(int irq, void *devid)
 {
 	struct owl_mmc_host *owl_host = devid;
-	unsigned long flags;
 	u32 state;
 
-	spin_lock_irqsave(&owl_host->lock, flags);
+	spin_lock(&owl_host->lock);
 
 	state = readl(owl_host->base + OWL_REG_SD_STATE);
 	if (state & OWL_SD_STATE_TEI) {
@@ -145,7 +147,7 @@ static irqreturn_t owl_irq_handler(int irq, void *devid)
 		complete(&owl_host->sdc_complete);
 	}
 
-	spin_unlock_irqrestore(&owl_host->lock, flags);
+	spin_unlock(&owl_host->lock);
 
 	return IRQ_HANDLED;
 }
@@ -172,6 +174,7 @@ static void owl_mmc_send_cmd(struct owl_mmc_host *owl_host,
 			     struct mmc_command *cmd,
 			     struct mmc_data *data)
 {
+	unsigned long timeout;
 	u32 mode, state, resp[2];
 	u32 cmd_rsp_mask = 0;
 
@@ -239,7 +242,10 @@ static void owl_mmc_send_cmd(struct owl_mmc_host *owl_host,
 	if (data)
 		return;
 
-	if (!wait_for_completion_timeout(&owl_host->sdc_complete, 30 * HZ)) {
+	timeout = msecs_to_jiffies(cmd->busy_timeout ? cmd->busy_timeout :
+		OWL_CMD_TIMEOUT_MS);
+
+	if (!wait_for_completion_timeout(&owl_host->sdc_complete, timeout)) {
 		dev_err(owl_host->dev, "CMD interrupt timeout\n");
 		cmd->error = -ETIMEDOUT;
 		return;
@@ -516,11 +522,11 @@ static void owl_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 
 	/* Enable DDR mode if requested */
 	if (ios->timing == MMC_TIMING_UHS_DDR50) {
-		owl_host->ddr_50 = 1;
+		owl_host->ddr_50 = true;
 		owl_mmc_update_reg(owl_host->base + OWL_REG_SD_EN,
 			       OWL_SD_EN_DDREN, true);
 	} else {
-		owl_host->ddr_50 = 0;
+		owl_host->ddr_50 = false;
 	}
 }
 
@@ -573,10 +579,8 @@ static int owl_mmc_probe(struct platform_device *pdev)
 	owl_host->mmc = mmc;
 	spin_lock_init(&owl_host->lock);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	owl_host->base = devm_ioremap_resource(&pdev->dev, res);
+	owl_host->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(owl_host->base)) {
-		dev_err(&pdev->dev, "Failed to remap registers\n");
 		ret = PTR_ERR(owl_host->base);
 		goto err_free_host;
 	}
@@ -634,8 +638,8 @@ static int owl_mmc_probe(struct platform_device *pdev)
 
 	owl_host->irq = platform_get_irq(pdev, 0);
 	if (owl_host->irq < 0) {
-		ret = -EINVAL;
-		goto err_free_host;
+		ret = owl_host->irq;
+		goto err_release_channel;
 	}
 
 	ret = devm_request_irq(&pdev->dev, owl_host->irq, owl_irq_handler,
@@ -643,35 +647,36 @@ static int owl_mmc_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to request irq %d\n",
 			owl_host->irq);
-		goto err_free_host;
+		goto err_release_channel;
 	}
 
 	ret = mmc_add_host(mmc);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to add host\n");
-		goto err_free_host;
+		goto err_release_channel;
 	}
 
 	dev_dbg(&pdev->dev, "Owl MMC Controller Initialized\n");
 
 	return 0;
 
+err_release_channel:
+	dma_release_channel(owl_host->dma);
 err_free_host:
 	mmc_free_host(mmc);
 
 	return ret;
 }
 
-static int owl_mmc_remove(struct platform_device *pdev)
+static void owl_mmc_remove(struct platform_device *pdev)
 {
 	struct mmc_host	*mmc = platform_get_drvdata(pdev);
 	struct owl_mmc_host *owl_host = mmc_priv(mmc);
 
 	mmc_remove_host(mmc);
 	disable_irq(owl_host->irq);
+	dma_release_channel(owl_host->dma);
 	mmc_free_host(mmc);
-
-	return 0;
 }
 
 static const struct of_device_id owl_mmc_of_match[] = {
@@ -683,10 +688,11 @@ MODULE_DEVICE_TABLE(of, owl_mmc_of_match);
 static struct platform_driver owl_mmc_driver = {
 	.driver = {
 		.name	= "owl_mmc",
-		.of_match_table = of_match_ptr(owl_mmc_of_match),
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.of_match_table = owl_mmc_of_match,
 	},
 	.probe		= owl_mmc_probe,
-	.remove		= owl_mmc_remove,
+	.remove_new	= owl_mmc_remove,
 };
 module_platform_driver(owl_mmc_driver);
 

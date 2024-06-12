@@ -6,11 +6,6 @@
 # for more details.
 #
 #
-KASAN_SANITIZE			:= n
-OBJECT_FILES_NON_STANDARD	:= y
-
-# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
-KCOV_INSTRUMENT		:= n
 
 always-y := realmode.bin realmode.relocs
 
@@ -71,5 +66,4 @@ $(obj)/realmode.relocs: $(obj)/realmode.elf FORCE
 KBUILD_CFLAGS	:= $(REALMODE_CFLAGS) -D_SETUP -D_WAKEUP \
 		   -I$(srctree)/arch/x86/boot
 KBUILD_AFLAGS	:= $(KBUILD_CFLAGS) -D__ASSEMBLY__
-GCOV_PROFILE := n
-UBSAN_SANITIZE := n
+KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables

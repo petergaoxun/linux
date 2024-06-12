@@ -38,17 +38,22 @@ struct vdso_data *arch_get_vdso_data(void *vvar_page)
 }
 #undef EMIT_VVAR
 
+unsigned int vclocks_used __read_mostly;
+
 #if defined(CONFIG_X86_64)
 unsigned int __read_mostly vdso64_enabled = 1;
 #endif
 
-void __init init_vdso_image(const struct vdso_image *image)
+int __init init_vdso_image(const struct vdso_image *image)
 {
+	BUILD_BUG_ON(VDSO_CLOCKMODE_MAX >= 32);
 	BUG_ON(image->size % PAGE_SIZE != 0);
 
 	apply_alternatives((struct alt_instr *)(image->data + image->alt),
 			   (struct alt_instr *)(image->data + image->alt +
 						image->alt_len));
+
+	return 0;
 }
 
 static const struct vm_special_mapping vvar_mapping;
@@ -87,11 +92,7 @@ static void vdso_fix_landing(const struct vdso_image *image,
 static int vdso_mremap(const struct vm_special_mapping *sm,
 		struct vm_area_struct *new_vma)
 {
-	unsigned long new_size = new_vma->vm_end - new_vma->vm_start;
 	const struct vdso_image *image = current->mm->context.vdso_image;
-
-	if (image->size != new_size)
-		return -EINVAL;
 
 	vdso_fix_landing(image, new_vma);
 	current->mm->context.vdso = (void __user *)new_vma->vm_start;
@@ -99,37 +100,7 @@ static int vdso_mremap(const struct vm_special_mapping *sm,
 	return 0;
 }
 
-static int vvar_mremap(const struct vm_special_mapping *sm,
-		struct vm_area_struct *new_vma)
-{
-	const struct vdso_image *image = new_vma->vm_mm->context.vdso_image;
-	unsigned long new_size = new_vma->vm_end - new_vma->vm_start;
-
-	if (new_size != -image->sym_vvar_start)
-		return -EINVAL;
-
-	return 0;
-}
-
 #ifdef CONFIG_TIME_NS
-static struct page *find_timens_vvar_page(struct vm_area_struct *vma)
-{
-	if (likely(vma->vm_mm == current->mm))
-		return current->nsproxy->time_ns->vvar_page;
-
-	/*
-	 * VM_PFNMAP | VM_IO protect .fault() handler from being called
-	 * through interfaces like /proc/$pid/mem or
-	 * process_vm_{readv,writev}() as long as there's no .access()
-	 * in special_mapping_vmops().
-	 * For more details check_vma_flags() and __access_remote_vm()
-	 */
-
-	WARN(1, "vvar_page accessed remotely");
-
-	return NULL;
-}
-
 /*
  * The vvar page layout depends on whether a task belongs to the root or
  * non-root time namespace. Whenever a task changes its namespace, the VVAR
@@ -141,24 +112,16 @@ int vdso_join_timens(struct task_struct *task, struct time_namespace *ns)
 {
 	struct mm_struct *mm = task->mm;
 	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
 
-	if (down_write_killable(&mm->mmap_sem))
-		return -EINTR;
-
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-		unsigned long size = vma->vm_end - vma->vm_start;
-
+	mmap_read_lock(mm);
+	for_each_vma(vmi, vma) {
 		if (vma_is_special_mapping(vma, &vvar_mapping))
-			zap_page_range(vma, vma->vm_start, size);
+			zap_vma_pages(vma);
 	}
+	mmap_read_unlock(mm);
 
-	up_write(&mm->mmap_sem);
 	return 0;
-}
-#else
-static inline struct page *find_timens_vvar_page(struct vm_area_struct *vma)
-{
-	return NULL;
 }
 #endif
 
@@ -219,17 +182,16 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
 	} else if (sym_offset == image->sym_pvclock_page) {
 		struct pvclock_vsyscall_time_info *pvti =
 			pvclock_get_pvti_cpu0_va();
-		if (pvti && vclock_was_used(VCLOCK_PVCLOCK)) {
+		if (pvti && vclock_was_used(VDSO_CLOCKMODE_PVCLOCK)) {
 			return vmf_insert_pfn_prot(vma, vmf->address,
 					__pa(pvti) >> PAGE_SHIFT,
 					pgprot_decrypted(vma->vm_page_prot));
 		}
 	} else if (sym_offset == image->sym_hvclock_page) {
-		struct ms_hyperv_tsc_page *tsc_pg = hv_get_tsc_page();
+		pfn = hv_get_tsc_pfn();
 
-		if (tsc_pg && vclock_was_used(VCLOCK_HVCLOCK))
-			return vmf_insert_pfn(vma, vmf->address,
-					virt_to_phys(tsc_pg) >> PAGE_SHIFT);
+		if (pfn && vclock_was_used(VDSO_CLOCKMODE_HVCLOCK))
+			return vmf_insert_pfn(vma, vmf->address, pfn);
 	} else if (sym_offset == image->sym_timens_page) {
 		struct page *timens_page = find_timens_vvar_page(vma);
 
@@ -251,7 +213,6 @@ static const struct vm_special_mapping vdso_mapping = {
 static const struct vm_special_mapping vvar_mapping = {
 	.name = "[vvar]",
 	.fault = vvar_fault,
-	.mremap = vvar_mremap,
 };
 
 /*
@@ -266,7 +227,7 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
 	unsigned long text_start;
 	int ret = 0;
 
-	if (down_write_killable(&mm->mmap_sem))
+	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 
 	addr = get_unmapped_area(NULL, addr,
@@ -309,84 +270,32 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
 	}
 
 up_fail:
-	up_write(&mm->mmap_sem);
+	mmap_write_unlock(mm);
 	return ret;
 }
-
-#ifdef CONFIG_X86_64
-/*
- * Put the vdso above the (randomized) stack with another randomized
- * offset.  This way there is no hole in the middle of address space.
- * To save memory make sure it is still in the same PTE as the stack
- * top.  This doesn't give that many random bits.
- *
- * Note that this algorithm is imperfect: the distribution of the vdso
- * start address within a PMD is biased toward the end.
- *
- * Only used for the 64-bit and x32 vdsos.
- */
-static unsigned long vdso_addr(unsigned long start, unsigned len)
-{
-	unsigned long addr, end;
-	unsigned offset;
-
-	/*
-	 * Round up the start address.  It can start out unaligned as a result
-	 * of stack start randomization.
-	 */
-	start = PAGE_ALIGN(start);
-
-	/* Round the lowest possible end address up to a PMD boundary. */
-	end = (start + len + PMD_SIZE - 1) & PMD_MASK;
-	if (end >= TASK_SIZE_MAX)
-		end = TASK_SIZE_MAX;
-	end -= len;
-
-	if (end > start) {
-		offset = get_random_int() % (((end - start) >> PAGE_SHIFT) + 1);
-		addr = start + (offset << PAGE_SHIFT);
-	} else {
-		addr = start;
-	}
-
-	/*
-	 * Forcibly align the final address in case we have a hardware
-	 * issue that requires alignment for performance reasons.
-	 */
-	addr = align_vdso_addr(addr);
-
-	return addr;
-}
-
-static int map_vdso_randomized(const struct vdso_image *image)
-{
-	unsigned long addr = vdso_addr(current->mm->start_stack, image->size-image->sym_vvar_start);
-
-	return map_vdso(image, addr);
-}
-#endif
 
 int map_vdso_once(const struct vdso_image *image, unsigned long addr)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
 
-	down_write(&mm->mmap_sem);
+	mmap_write_lock(mm);
 	/*
 	 * Check if we have already mapped vdso blob - fail to prevent
-	 * abusing from userspace install_speciall_mapping, which may
+	 * abusing from userspace install_special_mapping, which may
 	 * not do accounting and rlimit right.
 	 * We could search vma near context.vdso, but it's a slowpath,
 	 * so let's explicitly check all VMAs to be completely sure.
 	 */
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	for_each_vma(vmi, vma) {
 		if (vma_is_special_mapping(vma, &vdso_mapping) ||
 				vma_is_special_mapping(vma, &vvar_mapping)) {
-			up_write(&mm->mmap_sem);
+			mmap_write_unlock(mm);
 			return -EEXIST;
 		}
 	}
-	up_write(&mm->mmap_sem);
+	mmap_write_unlock(mm);
 
 	return map_vdso(image, addr);
 }
@@ -407,18 +316,18 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	if (!vdso64_enabled)
 		return 0;
 
-	return map_vdso_randomized(&vdso_image_64);
+	return map_vdso(&vdso_image_64, 0);
 }
 
 #ifdef CONFIG_COMPAT
 int compat_arch_setup_additional_pages(struct linux_binprm *bprm,
-				       int uses_interp)
+				       int uses_interp, bool x32)
 {
 #ifdef CONFIG_X86_X32_ABI
-	if (test_thread_flag(TIF_X32)) {
+	if (x32) {
 		if (!vdso64_enabled)
 			return 0;
-		return map_vdso_randomized(&vdso_image_x32);
+		return map_vdso(&vdso_image_x32, 0);
 	}
 #endif
 #ifdef CONFIG_IA32_EMULATION
@@ -435,23 +344,26 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 }
 #endif
 
+bool arch_syscall_is_vdso_sigreturn(struct pt_regs *regs)
+{
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+	const struct vdso_image *image = current->mm->context.vdso_image;
+	unsigned long vdso = (unsigned long) current->mm->context.vdso;
+
+	if (in_ia32_syscall() && image == &vdso_image_32) {
+		if (regs->ip == vdso + image->sym_vdso32_sigreturn_landing_pad ||
+		    regs->ip == vdso + image->sym_vdso32_rt_sigreturn_landing_pad)
+			return true;
+	}
+#endif
+	return false;
+}
+
 #ifdef CONFIG_X86_64
 static __init int vdso_setup(char *s)
 {
 	vdso64_enabled = simple_strtoul(s, NULL, 0);
-	return 0;
+	return 1;
 }
 __setup("vdso=", vdso_setup);
-
-static int __init init_vdso(void)
-{
-	init_vdso_image(&vdso_image_64);
-
-#ifdef CONFIG_X86_X32_ABI
-	init_vdso_image(&vdso_image_x32);
-#endif
-
-	return 0;
-}
-subsys_initcall(init_vdso);
 #endif /* CONFIG_X86_64 */

@@ -19,21 +19,6 @@
 extern __wsum csum_partial(const void *, int, __wsum);
 
 /*
- * The same as csum_partial, but copies from src while it checksums.
- *
- * Here even more important to align src and dst on a 32-bit (or even
- * better 64-bit) boundary
- */
-extern __wsum csum_partial_copy_nocheck(const void *, void *, int, __wsum);
-
-/*
- * this is a new version of the above that records errors it finds in *errp,
- * but continues and zeros the rest of the buffer.
- */
-extern __wsum csum_partial_copy_from_user(const void __user *src,
-		void *dst, int len, __wsum sum, int *errp);
-
-/*
  *	Optimized for IP headers, which always checksum on 4 octet boundaries.
  *
  *	Written by Randolph Chung <tausq@debian.org>, and then mucked with by
@@ -55,7 +40,7 @@ static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
 "	addc		%0, %5, %0\n"
 "	addc		%0, %3, %0\n"
 "1:	ldws,ma		4(%1), %3\n"
-"	addib,<		0, %2, 1b\n"
+"	addib,>		-1, %2, 1b\n"
 "	addc		%0, %3, %0\n"
 "\n"
 "	extru		%0, 31, 16, %4\n"
@@ -141,6 +126,7 @@ static __inline__ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 	** Try to keep 4 registers with "live" values ahead of the ALU.
 	*/
 
+"	depdi		0, 31, 32, %0\n"/* clear upper half of incoming checksum */
 "	ldd,ma		8(%1), %4\n"	/* get 1st saddr word */
 "	ldd,ma		8(%2), %5\n"	/* get 1st daddr word */
 "	add		%4, %0, %0\n"
@@ -152,8 +138,8 @@ static __inline__ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 "	add,dc		%3, %0, %0\n"  /* fold in proto+len | carry bit */
 "	extrd,u		%0, 31, 32, %4\n"/* copy upper half down */
 "	depdi		0, 31, 32, %0\n"/* clear upper half */
-"	add		%4, %0, %0\n"	/* fold into 32-bits */
-"	addc		0, %0, %0\n"	/* add carry */
+"	add,dc		%4, %0, %0\n"	/* fold into 32-bits, plus carry */
+"	addc		0, %0, %0\n"	/* add final carry */
 
 #else
 
@@ -178,7 +164,8 @@ static __inline__ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 "	ldw,ma		4(%2), %7\n"	/* 4th daddr */
 "	addc		%6, %0, %0\n"
 "	addc		%7, %0, %0\n"
-"	addc		%3, %0, %0\n"	/* fold in proto+len, catch carry */
+"	addc		%3, %0, %0\n"	/* fold in proto+len */
+"	addc		0, %0, %0\n"	/* add carry */
 
 #endif
 	: "=r" (sum), "=r" (saddr), "=r" (daddr), "=r" (len),
@@ -186,26 +173,6 @@ static __inline__ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 	: "0" (sum), "1" (saddr), "2" (daddr), "3" (len)
 	: "memory");
 	return csum_fold(sum);
-}
-
-/* 
- *	Copy and checksum to user
- */
-#define HAVE_CSUM_COPY_USER
-static __inline__ __wsum csum_and_copy_to_user(const void *src,
-						      void __user *dst,
-						      int len, __wsum sum,
-						      int *err_ptr)
-{
-	/* code stolen from include/asm-mips64 */
-	sum = csum_partial(src, len, sum);
-	 
-	if (copy_to_user(dst, src, len)) {
-		*err_ptr = -EFAULT;
-		return (__force __wsum)-1;
-	}
-
-	return sum;
 }
 
 #endif

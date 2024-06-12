@@ -1,64 +1,93 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2019 Facebook */
 #include <test_progs.h>
+#include "fexit_test.lskel.h"
+#include "fexit_many_args.skel.h"
+
+static int fexit_test_common(struct fexit_test_lskel *fexit_skel)
+{
+	int err, prog_fd, i;
+	int link_fd;
+	__u64 *result;
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+
+	err = fexit_test_lskel__attach(fexit_skel);
+	if (!ASSERT_OK(err, "fexit_attach"))
+		return err;
+
+	/* Check that already linked program can't be attached again. */
+	link_fd = fexit_test_lskel__test1__attach(fexit_skel);
+	if (!ASSERT_LT(link_fd, 0, "fexit_attach_link"))
+		return -1;
+
+	prog_fd = fexit_skel->progs.test1.prog_fd;
+	err = bpf_prog_test_run_opts(prog_fd, &topts);
+	ASSERT_OK(err, "test_run");
+	ASSERT_EQ(topts.retval, 0, "test_run");
+
+	result = (__u64 *)fexit_skel->bss;
+	for (i = 0; i < sizeof(*fexit_skel->bss) / sizeof(__u64); i++) {
+		if (!ASSERT_EQ(result[i], 1, "fexit_result"))
+			return -1;
+	}
+
+	fexit_test_lskel__detach(fexit_skel);
+
+	/* zero results for re-attach test */
+	memset(fexit_skel->bss, 0, sizeof(*fexit_skel->bss));
+	return 0;
+}
+
+static void fexit_test(void)
+{
+	struct fexit_test_lskel *fexit_skel = NULL;
+	int err;
+
+	fexit_skel = fexit_test_lskel__open_and_load();
+	if (!ASSERT_OK_PTR(fexit_skel, "fexit_skel_load"))
+		goto cleanup;
+
+	err = fexit_test_common(fexit_skel);
+	if (!ASSERT_OK(err, "fexit_first_attach"))
+		goto cleanup;
+
+	err = fexit_test_common(fexit_skel);
+	ASSERT_OK(err, "fexit_second_attach");
+
+cleanup:
+	fexit_test_lskel__destroy(fexit_skel);
+}
+
+static void fexit_many_args(void)
+{
+	struct fexit_many_args *fexit_skel = NULL;
+	int err;
+
+	fexit_skel = fexit_many_args__open_and_load();
+	if (!ASSERT_OK_PTR(fexit_skel, "fexit_many_args_skel_load"))
+		goto cleanup;
+
+	err = fexit_many_args__attach(fexit_skel);
+	if (!ASSERT_OK(err, "fexit_many_args_attach"))
+		goto cleanup;
+
+	ASSERT_OK(trigger_module_test_read(1), "trigger_read");
+
+	ASSERT_EQ(fexit_skel->bss->test1_result, 1,
+		  "fexit_many_args_result1");
+	ASSERT_EQ(fexit_skel->bss->test2_result, 1,
+		  "fexit_many_args_result2");
+	ASSERT_EQ(fexit_skel->bss->test3_result, 1,
+		  "fexit_many_args_result3");
+
+cleanup:
+	fexit_many_args__destroy(fexit_skel);
+}
 
 void test_fexit_test(void)
 {
-	struct bpf_prog_load_attr attr = {
-		.file = "./fexit_test.o",
-	};
-
-	char prog_name[] = "fexit/bpf_fentry_testX";
-	struct bpf_object *obj = NULL, *pkt_obj;
-	int err, pkt_fd, kfree_skb_fd, i;
-	struct bpf_link *link[6] = {};
-	struct bpf_program *prog[6];
-	__u32 duration = 0, retval;
-	struct bpf_map *data_map;
-	const int zero = 0;
-	u64 result[6];
-
-	err = bpf_prog_load("./test_pkt_access.o", BPF_PROG_TYPE_SCHED_CLS,
-			    &pkt_obj, &pkt_fd);
-	if (CHECK(err, "prog_load sched cls", "err %d errno %d\n", err, errno))
-		return;
-	err = bpf_prog_load_xattr(&attr, &obj, &kfree_skb_fd);
-	if (CHECK(err, "prog_load fail", "err %d errno %d\n", err, errno))
-		goto close_prog;
-
-	for (i = 0; i < 6; i++) {
-		prog_name[sizeof(prog_name) - 2] = '1' + i;
-		prog[i] = bpf_object__find_program_by_title(obj, prog_name);
-		if (CHECK(!prog[i], "find_prog", "prog %s not found\n", prog_name))
-			goto close_prog;
-		link[i] = bpf_program__attach_trace(prog[i]);
-		if (CHECK(IS_ERR(link[i]), "attach_trace", "failed to link\n"))
-			goto close_prog;
-	}
-	data_map = bpf_object__find_map_by_name(obj, "fexit_te.bss");
-	if (CHECK(!data_map, "find_data_map", "data map not found\n"))
-		goto close_prog;
-
-	err = bpf_prog_test_run(pkt_fd, 1, &pkt_v6, sizeof(pkt_v6),
-				NULL, NULL, &retval, &duration);
-	CHECK(err || retval, "ipv6",
-	      "err %d errno %d retval %d duration %d\n",
-	      err, errno, retval, duration);
-
-	err = bpf_map_lookup_elem(bpf_map__fd(data_map), &zero, &result);
-	if (CHECK(err, "get_result",
-		  "failed to get output data: %d\n", err))
-		goto close_prog;
-
-	for (i = 0; i < 6; i++)
-		if (CHECK(result[i] != 1, "result", "bpf_fentry_test%d failed err %ld\n",
-			  i + 1, result[i]))
-			goto close_prog;
-
-close_prog:
-	for (i = 0; i < 6; i++)
-		if (!IS_ERR_OR_NULL(link[i]))
-			bpf_link__destroy(link[i]);
-	bpf_object__close(obj);
-	bpf_object__close(pkt_obj);
+	if (test__start_subtest("fexit"))
+		fexit_test();
+	if (test__start_subtest("fexit_many_args"))
+		fexit_many_args();
 }

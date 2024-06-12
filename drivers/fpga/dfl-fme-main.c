@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/uaccess.h>
+#include <linux/units.h>
 #include <linux/fpga-dfl.h>
 
 #include "dfl.h"
@@ -231,19 +232,19 @@ static int thermal_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	switch (attr) {
 	case hwmon_temp_input:
 		v = readq(feature->ioaddr + FME_THERM_RDSENSOR_FMT1);
-		*val = (long)(FIELD_GET(FPGA_TEMPERATURE, v) * 1000);
+		*val = (long)(FIELD_GET(FPGA_TEMPERATURE, v) * MILLI);
 		break;
 	case hwmon_temp_max:
 		v = readq(feature->ioaddr + FME_THERM_THRESHOLD);
-		*val = (long)(FIELD_GET(TEMP_THRESHOLD1, v) * 1000);
+		*val = (long)(FIELD_GET(TEMP_THRESHOLD1, v) * MILLI);
 		break;
 	case hwmon_temp_crit:
 		v = readq(feature->ioaddr + FME_THERM_THRESHOLD);
-		*val = (long)(FIELD_GET(TEMP_THRESHOLD2, v) * 1000);
+		*val = (long)(FIELD_GET(TEMP_THRESHOLD2, v) * MILLI);
 		break;
 	case hwmon_temp_emergency:
 		v = readq(feature->ioaddr + FME_THERM_THRESHOLD);
-		*val = (long)(FIELD_GET(TRIP_THRESHOLD, v) * 1000);
+		*val = (long)(FIELD_GET(TRIP_THRESHOLD, v) * MILLI);
 		break;
 	case hwmon_temp_max_alarm:
 		v = readq(feature->ioaddr + FME_THERM_THRESHOLD);
@@ -265,7 +266,7 @@ static const struct hwmon_ops thermal_hwmon_ops = {
 	.read = thermal_hwmon_read,
 };
 
-static const struct hwmon_channel_info *thermal_hwmon_info[] = {
+static const struct hwmon_channel_info * const thermal_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_EMERGENCY |
 				 HWMON_T_MAX   | HWMON_T_MAX_ALARM |
 				 HWMON_T_CRIT  | HWMON_T_CRIT_ALARM),
@@ -382,15 +383,15 @@ static int power_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	switch (attr) {
 	case hwmon_power_input:
 		v = readq(feature->ioaddr + FME_PWR_STATUS);
-		*val = (long)(FIELD_GET(PWR_CONSUMED, v) * 1000000);
+		*val = (long)(FIELD_GET(PWR_CONSUMED, v) * MICRO);
 		break;
 	case hwmon_power_max:
 		v = readq(feature->ioaddr + FME_PWR_THRESHOLD);
-		*val = (long)(FIELD_GET(PWR_THRESHOLD1, v) * 1000000);
+		*val = (long)(FIELD_GET(PWR_THRESHOLD1, v) * MICRO);
 		break;
 	case hwmon_power_crit:
 		v = readq(feature->ioaddr + FME_PWR_THRESHOLD);
-		*val = (long)(FIELD_GET(PWR_THRESHOLD2, v) * 1000000);
+		*val = (long)(FIELD_GET(PWR_THRESHOLD2, v) * MICRO);
 		break;
 	case hwmon_power_max_alarm:
 		v = readq(feature->ioaddr + FME_PWR_THRESHOLD);
@@ -415,7 +416,7 @@ static int power_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 	int ret = 0;
 	u64 v;
 
-	val = clamp_val(val / 1000000, 0, PWR_THRESHOLD_MAX);
+	val = clamp_val(val / MICRO, 0, PWR_THRESHOLD_MAX);
 
 	mutex_lock(&pdata->lock);
 
@@ -465,7 +466,7 @@ static const struct hwmon_ops power_hwmon_ops = {
 	.write = power_hwmon_write,
 };
 
-static const struct hwmon_channel_info *power_hwmon_info[] = {
+static const struct hwmon_channel_info * const power_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT |
 				  HWMON_P_MAX   | HWMON_P_MAX_ALARM |
 				  HWMON_P_CRIT  | HWMON_P_CRIT_ALARM),
@@ -580,6 +581,10 @@ static struct dfl_feature_driver fme_feature_drvs[] = {
 		.ops = &fme_power_mgmt_ops,
 	},
 	{
+		.id_table = fme_perf_id_table,
+		.ops = &fme_perf_ops,
+	},
+	{
 		.ops = NULL,
 	},
 };
@@ -600,23 +605,34 @@ static int fme_open(struct inode *inode, struct file *filp)
 	if (WARN_ON(!pdata))
 		return -ENODEV;
 
-	ret = dfl_feature_dev_use_begin(pdata);
-	if (ret)
-		return ret;
+	mutex_lock(&pdata->lock);
+	ret = dfl_feature_dev_use_begin(pdata, filp->f_flags & O_EXCL);
+	if (!ret) {
+		dev_dbg(&fdev->dev, "Device File Opened %d Times\n",
+			dfl_feature_dev_use_count(pdata));
+		filp->private_data = pdata;
+	}
+	mutex_unlock(&pdata->lock);
 
-	dev_dbg(&fdev->dev, "Device File Open\n");
-	filp->private_data = pdata;
-
-	return 0;
+	return ret;
 }
 
 static int fme_release(struct inode *inode, struct file *filp)
 {
 	struct dfl_feature_platform_data *pdata = filp->private_data;
 	struct platform_device *pdev = pdata->dev;
+	struct dfl_feature *feature;
 
 	dev_dbg(&pdev->dev, "Device File Release\n");
+
+	mutex_lock(&pdata->lock);
 	dfl_feature_dev_use_end(pdata);
+
+	if (!dfl_feature_dev_use_count(pdata))
+		dfl_fpga_dev_for_each_feature(pdata, feature)
+			dfl_fpga_set_irq_triggers(feature, 0,
+						  feature->nr_irqs, NULL);
+	mutex_unlock(&pdata->lock);
 
 	return 0;
 }
@@ -662,8 +678,6 @@ static int fme_dev_init(struct platform_device *pdev)
 	fme = devm_kzalloc(&pdev->dev, sizeof(*fme), GFP_KERNEL);
 	if (!fme)
 		return -ENOMEM;
-
-	fme->pdata = pdata;
 
 	mutex_lock(&pdata->lock);
 	dfl_fpga_pdata_set_private(pdata, fme);
@@ -714,13 +728,11 @@ exit:
 	return ret;
 }
 
-static int fme_remove(struct platform_device *pdev)
+static void fme_remove(struct platform_device *pdev)
 {
 	dfl_fpga_dev_ops_unregister(pdev);
 	dfl_fpga_dev_feature_uinit(pdev);
 	fme_dev_destroy(pdev);
-
-	return 0;
 }
 
 static const struct attribute_group *fme_dev_groups[] = {
@@ -735,7 +747,7 @@ static struct platform_driver fme_driver = {
 		.dev_groups = fme_dev_groups,
 	},
 	.probe   = fme_probe,
-	.remove  = fme_remove,
+	.remove_new = fme_remove,
 };
 
 module_platform_driver(fme_driver);

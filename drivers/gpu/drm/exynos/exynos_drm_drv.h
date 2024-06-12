@@ -197,8 +197,6 @@ struct drm_exynos_file_private {
  * @wait: wait an atomic commit to finish
  */
 struct exynos_drm_private {
-	struct drm_fb_helper *fb_helper;
-
 	struct device *g2d_dev;
 	struct device *dma_dev;
 	void *mapping;
@@ -223,8 +221,10 @@ static inline bool is_drm_iommu_supported(struct drm_device *drm_dev)
 	return priv->mapping ? true : false;
 }
 
-int exynos_drm_register_dma(struct drm_device *drm, struct device *dev);
-void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev);
+int exynos_drm_register_dma(struct drm_device *drm, struct device *dev,
+			    void **dma_priv);
+void exynos_drm_unregister_dma(struct drm_device *drm, struct device *dev,
+			       void **dma_priv);
 void exynos_drm_cleanup_dma(struct drm_device *drm);
 
 #ifdef CONFIG_DRM_EXYNOS_DPI

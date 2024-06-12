@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
@@ -405,10 +406,9 @@ static int stm32_spdifrx_dma_ctrl_register(struct device *dev,
 	int ret;
 
 	spdifrx->ctrl_chan = dma_request_chan(dev, "rx-ctrl");
-	if (IS_ERR(spdifrx->ctrl_chan)) {
-		dev_err(dev, "dma_request_slave_channel failed\n");
-		return PTR_ERR(spdifrx->ctrl_chan);
-	}
+	if (IS_ERR(spdifrx->ctrl_chan))
+		return dev_err_probe(dev, PTR_ERR(spdifrx->ctrl_chan),
+				     "dma_request_slave_channel error\n");
 
 	spdifrx->dmab = devm_kzalloc(dev, sizeof(struct snd_dma_buffer),
 				     GFP_KERNEL);
@@ -856,6 +856,7 @@ static void stm32_spdifrx_shutdown(struct snd_pcm_substream *substream,
 }
 
 static const struct snd_soc_dai_ops stm32_spdifrx_pcm_dai_ops = {
+	.probe		= stm32_spdifrx_dai_probe,
 	.startup	= stm32_spdifrx_startup,
 	.hw_params	= stm32_spdifrx_hw_params,
 	.trigger	= stm32_spdifrx_trigger,
@@ -864,7 +865,6 @@ static const struct snd_soc_dai_ops stm32_spdifrx_pcm_dai_ops = {
 
 static struct snd_soc_dai_driver stm32_spdifrx_dai[] = {
 	{
-		.probe = stm32_spdifrx_dai_probe,
 		.capture = {
 			.stream_name = "CPU-Capture",
 			.channels_min = 1,
@@ -888,6 +888,7 @@ static const struct snd_pcm_hardware stm32_spdifrx_pcm_hw = {
 
 static const struct snd_soc_component_driver stm32_spdifrx_component = {
 	.name = "stm32-spdifrx",
+	.legacy_dai_naming = 1,
 };
 
 static const struct snd_dmaengine_pcm_config stm32_spdifrx_pcm_config = {
@@ -907,37 +908,46 @@ static int stm32_spdifrx_parse_of(struct platform_device *pdev,
 				  struct stm32_spdifrx_data *spdifrx)
 {
 	struct device_node *np = pdev->dev.of_node;
-	const struct of_device_id *of_id;
 	struct resource *res;
 
 	if (!np)
 		return -ENODEV;
 
-	of_id = of_match_device(stm32_spdifrx_ids, &pdev->dev);
-	if (of_id)
-		spdifrx->regmap_conf =
-			(const struct regmap_config *)of_id->data;
-	else
+	spdifrx->regmap_conf = device_get_match_data(&pdev->dev);
+	if (!spdifrx->regmap_conf)
 		return -EINVAL;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	spdifrx->base = devm_ioremap_resource(&pdev->dev, res);
+	spdifrx->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(spdifrx->base))
 		return PTR_ERR(spdifrx->base);
 
 	spdifrx->phys_addr = res->start;
 
 	spdifrx->kclk = devm_clk_get(&pdev->dev, "kclk");
-	if (IS_ERR(spdifrx->kclk)) {
-		dev_err(&pdev->dev, "Could not get kclk\n");
-		return PTR_ERR(spdifrx->kclk);
-	}
+	if (IS_ERR(spdifrx->kclk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(spdifrx->kclk),
+				     "Could not get kclk\n");
 
 	spdifrx->irq = platform_get_irq(pdev, 0);
 	if (spdifrx->irq < 0)
 		return spdifrx->irq;
 
 	return 0;
+}
+
+static void stm32_spdifrx_remove(struct platform_device *pdev)
+{
+	struct stm32_spdifrx_data *spdifrx = platform_get_drvdata(pdev);
+
+	if (spdifrx->ctrl_chan)
+		dma_release_channel(spdifrx->ctrl_chan);
+
+	if (spdifrx->dmab)
+		snd_dma_free_pages(spdifrx->dmab);
+
+	snd_dmaengine_pcm_unregister(&pdev->dev);
+	snd_soc_unregister_component(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 }
 
 static int stm32_spdifrx_probe(struct platform_device *pdev)
@@ -966,10 +976,9 @@ static int stm32_spdifrx_probe(struct platform_device *pdev)
 	spdifrx->regmap = devm_regmap_init_mmio_clk(&pdev->dev, "kclk",
 						    spdifrx->base,
 						    spdifrx->regmap_conf);
-	if (IS_ERR(spdifrx->regmap)) {
-		dev_err(&pdev->dev, "Regmap init failed\n");
-		return PTR_ERR(spdifrx->regmap);
-	}
+	if (IS_ERR(spdifrx->regmap))
+		return dev_err_probe(&pdev->dev, PTR_ERR(spdifrx->regmap),
+				     "Regmap init error\n");
 
 	ret = devm_request_irq(&pdev->dev, spdifrx->irq, stm32_spdifrx_isr, 0,
 			       dev_name(&pdev->dev), spdifrx);
@@ -978,30 +987,32 @@ static int stm32_spdifrx_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	rst = devm_reset_control_get_exclusive(&pdev->dev, NULL);
-	if (!IS_ERR(rst)) {
-		reset_control_assert(rst);
-		udelay(2);
-		reset_control_deassert(rst);
-	}
+	rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
+	if (IS_ERR(rst))
+		return dev_err_probe(&pdev->dev, PTR_ERR(rst),
+				     "Reset controller error\n");
 
-	ret = devm_snd_soc_register_component(&pdev->dev,
-					      &stm32_spdifrx_component,
-					      stm32_spdifrx_dai,
-					      ARRAY_SIZE(stm32_spdifrx_dai));
+	reset_control_assert(rst);
+	udelay(2);
+	reset_control_deassert(rst);
+
+	pcm_config = &stm32_spdifrx_pcm_config;
+	ret = snd_dmaengine_pcm_register(&pdev->dev, pcm_config, 0);
 	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "PCM DMA register error\n");
+
+	ret = snd_soc_register_component(&pdev->dev,
+					 &stm32_spdifrx_component,
+					 stm32_spdifrx_dai,
+					 ARRAY_SIZE(stm32_spdifrx_dai));
+	if (ret) {
+		snd_dmaengine_pcm_unregister(&pdev->dev);
 		return ret;
+	}
 
 	ret = stm32_spdifrx_dma_ctrl_register(&pdev->dev, spdifrx);
 	if (ret)
 		goto error;
-
-	pcm_config = &stm32_spdifrx_pcm_config;
-	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, pcm_config, 0);
-	if (ret) {
-		dev_err(&pdev->dev, "PCM DMA register returned %d\n", ret);
-		goto error;
-	}
 
 	ret = regmap_read(spdifrx->regmap, STM32_SPDIFRX_IDR, &idr);
 	if (ret)
@@ -1009,34 +1020,22 @@ static int stm32_spdifrx_probe(struct platform_device *pdev)
 
 	if (idr == SPDIFRX_IPIDR_NUMBER) {
 		ret = regmap_read(spdifrx->regmap, STM32_SPDIFRX_VERR, &ver);
+		if (ret)
+			goto error;
 
 		dev_dbg(&pdev->dev, "SPDIFRX version: %lu.%lu registered\n",
 			FIELD_GET(SPDIFRX_VERR_MAJ_MASK, ver),
 			FIELD_GET(SPDIFRX_VERR_MIN_MASK, ver));
 	}
 
+	pm_runtime_enable(&pdev->dev);
+
 	return ret;
 
 error:
-	if (!IS_ERR(spdifrx->ctrl_chan))
-		dma_release_channel(spdifrx->ctrl_chan);
-	if (spdifrx->dmab)
-		snd_dma_free_pages(spdifrx->dmab);
+	stm32_spdifrx_remove(pdev);
 
 	return ret;
-}
-
-static int stm32_spdifrx_remove(struct platform_device *pdev)
-{
-	struct stm32_spdifrx_data *spdifrx = platform_get_drvdata(pdev);
-
-	if (spdifrx->ctrl_chan)
-		dma_release_channel(spdifrx->ctrl_chan);
-
-	if (spdifrx->dmab)
-		snd_dma_free_pages(spdifrx->dmab);
-
-	return 0;
 }
 
 MODULE_DEVICE_TABLE(of, stm32_spdifrx_ids);
@@ -1073,7 +1072,7 @@ static struct platform_driver stm32_spdifrx_driver = {
 		.pm = &stm32_spdifrx_pm_ops,
 	},
 	.probe = stm32_spdifrx_probe,
-	.remove = stm32_spdifrx_remove,
+	.remove_new = stm32_spdifrx_remove,
 };
 
 module_platform_driver(stm32_spdifrx_driver);

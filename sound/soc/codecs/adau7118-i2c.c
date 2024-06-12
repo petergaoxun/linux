@@ -32,17 +32,23 @@ static const struct reg_default adau7118_reg_defaults[] = {
 	{ ADAU7118_REG_RESET, 0x00 },
 };
 
+static bool adau7118_volatile(struct device *dev, unsigned int reg)
+{
+	return (reg == ADAU7118_REG_RESET);
+}
+
+
 static const struct regmap_config adau7118_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.reg_defaults = adau7118_reg_defaults,
 	.num_reg_defaults = ARRAY_SIZE(adau7118_reg_defaults),
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.max_register = ADAU7118_REG_RESET,
+	.volatile_reg = adau7118_volatile,
 };
 
-static int adau7118_probe_i2c(struct i2c_client *i2c,
-			      const struct i2c_device_id *id)
+static int adau7118_probe_i2c(struct i2c_client *i2c)
 {
 	struct regmap *map;
 
@@ -62,7 +68,7 @@ static const struct of_device_id adau7118_of_match[] = {
 MODULE_DEVICE_TABLE(of, adau7118_of_match);
 
 static const struct i2c_device_id adau7118_id[] = {
-	{"adau7118", 0},
+	{"adau7118"},
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, adau7118_id);

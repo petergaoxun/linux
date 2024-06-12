@@ -2,7 +2,7 @@
 
 # Global interface:
 #  $put -- port under test (e.g. $swp2)
-#  get_stats($band) -- A function to collect stats for band
+#  collect_stats($streams...) -- A function to get stats for individual streams
 #  ets_start_traffic($band) -- Start traffic for this band
 #  ets_change_qdisc($op, $dev, $nstrict, $quanta...) -- Add or change qdisc
 
@@ -94,15 +94,11 @@ __ets_dwrr_test()
 
 	sleep 10
 
-	t0=($(for stream in ${streams[@]}; do
-		  get_stats $stream
-	      done))
+	t0=($(collect_stats "${streams[@]}"))
 
 	sleep 10
 
-	t1=($(for stream in ${streams[@]}; do
-		  get_stats $stream
-	      done))
+	t1=($(collect_stats "${streams[@]}"))
 	d=($(for ((i = 0; i < ${#streams[@]}; i++)); do
 		 echo $((${t1[$i]} - ${t0[$i]}))
 	     done))
@@ -203,25 +199,28 @@ ets_set_dwrr_two_bands()
 ets_test_strict()
 {
 	ets_set_strict
-	ets_dwrr_test_01
-	ets_dwrr_test_12
+	xfail_on_slow ets_dwrr_test_01
+	xfail_on_slow ets_dwrr_test_12
 }
 
 ets_test_mixed()
 {
 	ets_set_mixed
-	ets_dwrr_test_01
-	ets_dwrr_test_12
+	xfail_on_slow ets_dwrr_test_01
+	xfail_on_slow ets_dwrr_test_12
 }
 
 ets_test_dwrr()
 {
 	ets_set_dwrr_uniform
-	ets_dwrr_test_012
+	xfail_on_slow ets_dwrr_test_012
+
 	ets_set_dwrr_varying
-	ets_dwrr_test_012
+	xfail_on_slow ets_dwrr_test_012
+
 	ets_change_quantum
-	ets_dwrr_test_012
+	xfail_on_slow ets_dwrr_test_012
+
 	ets_set_dwrr_two_bands
-	ets_dwrr_test_01
+	xfail_on_slow ets_dwrr_test_01
 }

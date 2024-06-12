@@ -15,9 +15,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
-#if defined(CONFIG_OF)
-#include <linux/of_platform.h>
-#endif
+
 #include "mb862xxfb.h"
 #include "mb862xx_reg.h"
 #include "mb862xxfb_accel.h"
@@ -132,7 +130,7 @@ static void mb86290fb_imageblit8(u32 *cmd, u16 step, u16 dx, u16 dy,
 	cmd[2] = (height << 16) | width;
 
 	i = 0;
-	line = ptr = image->data;
+	line = image->data;
 	bytes = image->width;
 
 	while (i < height) {
@@ -184,7 +182,6 @@ static void mb86290fb_imageblit16(u32 *cmd, u16 step, u16 dx, u16 dy,
 static void mb86290fb_imageblit(struct fb_info *info,
 				const struct fb_image *image)
 {
-	int mdr;
 	u32 *cmd = NULL;
 	void (*cmdfn) (u32 *, u16, u16, u16, u16, u16, u32, u32,
 		       const struct fb_image *, struct fb_info *) = NULL;
@@ -196,7 +193,6 @@ static void mb86290fb_imageblit(struct fb_info *info,
 	u16 dx = image->dx, dy = image->dy;
 	int x2, y2, vxres, vyres;
 
-	mdr = (GDC_ROP_COPY << 9);
 	x2 = image->dx + image->width;
 	y2 = image->dy + image->height;
 	vxres = info->var.xres_virtual;

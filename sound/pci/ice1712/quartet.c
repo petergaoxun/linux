@@ -566,7 +566,7 @@ static int qtet_ain12_sw_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_ice1712 *ice = snd_kcontrol_chip(kcontrol);
 	unsigned int old, new, tmp, masked_old;
-	old = new = get_scr(ice);
+	old = get_scr(ice);
 	masked_old = old & (SCR_AIN12_SEL1 | SCR_AIN12_SEL0);
 	tmp = ucontrol->value.integer.value[0];
 	if (tmp == 2)
@@ -757,7 +757,7 @@ static const struct snd_kcontrol_new qtet_controls[] = {
 	QTET_CONTROL("Output 3/4 to Monitor 1/2", sw, OUT34_MON12),
 };
 
-static const char * const slave_vols[] = {
+static const char * const follower_vols[] = {
 	PCM_12_PLAYBACK_VOLUME,
 	PCM_34_PLAYBACK_VOLUME,
 	NULL
@@ -765,26 +765,6 @@ static const char * const slave_vols[] = {
 
 static
 DECLARE_TLV_DB_SCALE(qtet_master_db_scale, -6350, 50, 1);
-
-static struct snd_kcontrol *ctl_find(struct snd_card *card,
-				     const char *name)
-{
-	struct snd_ctl_elem_id sid = {0};
-
-	strlcpy(sid.name, name, sizeof(sid.name));
-	sid.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
-	return snd_ctl_find_id(card, &sid);
-}
-
-static void add_slaves(struct snd_card *card,
-		       struct snd_kcontrol *master, const char * const *list)
-{
-	for (; *list; list++) {
-		struct snd_kcontrol *slave = ctl_find(card, *list);
-		if (slave)
-			snd_ctl_add_slave(master, slave);
-	}
-}
 
 static int qtet_add_controls(struct snd_ice1712 *ice)
 {
@@ -806,8 +786,10 @@ static int qtet_add_controls(struct snd_ice1712 *ice)
 			qtet_master_db_scale);
 	if (!vmaster)
 		return -ENOMEM;
-	add_slaves(ice->card, vmaster, slave_vols);
 	err = snd_ctl_add(ice->card, vmaster);
+	if (err < 0)
+		return err;
+	err = snd_ctl_add_followers(ice->card, vmaster, follower_vols);
 	if (err < 0)
 		return err;
 	/* only capture SPDIF over AK4113 */

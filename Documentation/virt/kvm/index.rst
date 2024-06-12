@@ -8,21 +8,14 @@ KVM
    :maxdepth: 2
 
    api
-   amd-memory-encryption
-   cpuid
-   halt-polling
-   hypercalls
-   locking
-   mmu
-   msr
-   nested-vmx
-   ppc-pv
-   s390-diag
-   timekeeping
-   vcpu-requests
-
-   review-checklist
+   devices/index
 
    arm/index
+   s390/index
+   ppc-pv
+   x86/index
 
-   devices/index
+   locking
+   vcpu-requests
+   halt-polling
+   review-checklist

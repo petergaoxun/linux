@@ -16,6 +16,8 @@
 #include <linux/kernel.h>
 #include <linux/cpu.h>
 #include <linux/hardirq.h>
+#include <linux/of.h>
+#include <linux/libfdt.h>
 
 #include <asm/page.h>
 #include <asm/current.h>
@@ -25,14 +27,13 @@
 #include <asm/paca.h>
 #include <asm/mmu.h>
 #include <asm/sections.h>	/* _end */
-#include <asm/prom.h>
 #include <asm/smp.h>
 #include <asm/hw_breakpoint.h>
-#include <asm/asm-prototypes.h>
 #include <asm/svm.h>
 #include <asm/ultravisor.h>
+#include <asm/crashdump-ppc64.h>
 
-int default_machine_kexec_prepare(struct kimage *image)
+int machine_kexec_prepare(struct kimage *image)
 {
 	int i;
 	unsigned long begin, end;	/* limits of segment */
@@ -64,15 +65,18 @@ int default_machine_kexec_prepare(struct kimage *image)
 			begin = image->segment[i].mem;
 			end = begin + image->segment[i].memsz;
 
-			if ((begin < high) && (end > low))
+			if ((begin < high) && (end > low)) {
+				of_node_put(node);
 				return -ETXTBSY;
+			}
 		}
 	}
 
 	return 0;
 }
 
-static void copy_segments(unsigned long ind)
+/* Called during kexec sequence with MMU off */
+static notrace void copy_segments(unsigned long ind)
 {
 	unsigned long entry;
 	unsigned long *ptr;
@@ -105,7 +109,8 @@ static void copy_segments(unsigned long ind)
 	}
 }
 
-void kexec_copy_flush(struct kimage *image)
+/* Called during kexec sequence with MMU off */
+notrace void kexec_copy_flush(struct kimage *image)
 {
 	long i, nr_segments = image->nr_segments;
 	struct  kexec_segment ranges[KEXEC_SEGMENT_MAX];
@@ -151,6 +156,8 @@ static void kexec_smp_down(void *arg)
 	 */
 	if (ppc_md.kexec_cpu_down)
 		ppc_md.kexec_cpu_down(0, 1);
+
+	reset_sprs();
 
 	kexec_smp_wait();
 	/* NOTREACHED */
@@ -212,7 +219,7 @@ static void wake_offline_cpus(void)
 		if (!cpu_online(cpu)) {
 			printk(KERN_INFO "kexec: Waking offline cpu %d.\n",
 			       cpu);
-			WARN_ON(cpu_up(cpu));
+			WARN_ON(add_cpu(cpu));
 		}
 	}
 }
@@ -278,14 +285,13 @@ static void kexec_prepare_cpus(void)
  * We could use a smaller stack if we don't care about anything using
  * current, but that audit has not been performed.
  */
-static union thread_union kexec_stack __init_task_data =
-	{ };
+static union thread_union kexec_stack = { };
 
 /*
  * For similar reasons to the stack above, the kexecing CPU needs to be on a
  * static PACA; we switch to kexec_paca.
  */
-struct paca_struct kexec_paca;
+static struct paca_struct kexec_paca;
 
 /* Our assembly helper, in misc_64.S */
 extern void kexec_sequence(void *newstack, unsigned long start,
@@ -355,7 +361,7 @@ void default_machine_kexec(struct kimage *image)
 	 * the RMA. On BookE there is no real MMU off mode, so we have to
 	 * keep it enabled as well (but then we have bolted TLB entries).
 	 */
-#ifdef CONFIG_PPC_BOOK3E
+#ifdef CONFIG_PPC_BOOK3E_64
 	copy_with_mmu_off = false;
 #else
 	copy_with_mmu_off = radix_enabled() ||
@@ -372,10 +378,10 @@ void default_machine_kexec(struct kimage *image)
 	/* NOTREACHED */
 }
 
-#ifdef CONFIG_PPC_BOOK3S_64
+#ifdef CONFIG_PPC_64S_HASH_MMU
 /* Values we need to export to the second kernel via the device tree. */
-static unsigned long htab_base;
-static unsigned long htab_size;
+static __be64 htab_base;
+static __be64 htab_size;
 
 static struct property htab_base_prop = {
 	.name = "linux,htab-base",
@@ -401,7 +407,7 @@ static int __init export_htab_values(void)
 	if (!node)
 		return -ENODEV;
 
-	/* remove any stale propertys so ours can be found */
+	/* remove any stale properties so ours can be found */
 	of_remove_property(node, of_find_property(node, htab_base_prop.name, NULL));
 	of_remove_property(node, of_find_property(node, htab_size_prop.name, NULL));
 
@@ -414,4 +420,93 @@ static int __init export_htab_values(void)
 	return 0;
 }
 late_initcall(export_htab_values);
-#endif /* CONFIG_PPC_BOOK3S_64 */
+#endif /* CONFIG_PPC_64S_HASH_MMU */
+
+#if defined(CONFIG_KEXEC_FILE) || defined(CONFIG_CRASH_DUMP)
+/**
+ * add_node_props - Reads node properties from device node structure and add
+ *                  them to fdt.
+ * @fdt:            Flattened device tree of the kernel
+ * @node_offset:    offset of the node to add a property at
+ * @dn:             device node pointer
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+static int add_node_props(void *fdt, int node_offset, const struct device_node *dn)
+{
+	int ret = 0;
+	struct property *pp;
+
+	if (!dn)
+		return -EINVAL;
+
+	for_each_property_of_node(dn, pp) {
+		ret = fdt_setprop(fdt, node_offset, pp->name, pp->value, pp->length);
+		if (ret < 0) {
+			pr_err("Unable to add %s property: %s\n", pp->name, fdt_strerror(ret));
+			return ret;
+		}
+	}
+	return ret;
+}
+
+/**
+ * update_cpus_node - Update cpus node of flattened device tree using of_root
+ *                    device node.
+ * @fdt:              Flattened device tree of the kernel.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+int update_cpus_node(void *fdt)
+{
+	struct device_node *cpus_node, *dn;
+	int cpus_offset, cpus_subnode_offset, ret = 0;
+
+	cpus_offset = fdt_path_offset(fdt, "/cpus");
+	if (cpus_offset < 0 && cpus_offset != -FDT_ERR_NOTFOUND) {
+		pr_err("Malformed device tree: error reading /cpus node: %s\n",
+		       fdt_strerror(cpus_offset));
+		return cpus_offset;
+	}
+
+	if (cpus_offset > 0) {
+		ret = fdt_del_node(fdt, cpus_offset);
+		if (ret < 0) {
+			pr_err("Error deleting /cpus node: %s\n", fdt_strerror(ret));
+			return -EINVAL;
+		}
+	}
+
+	/* Add cpus node to fdt */
+	cpus_offset = fdt_add_subnode(fdt, fdt_path_offset(fdt, "/"), "cpus");
+	if (cpus_offset < 0) {
+		pr_err("Error creating /cpus node: %s\n", fdt_strerror(cpus_offset));
+		return -EINVAL;
+	}
+
+	/* Add cpus node properties */
+	cpus_node = of_find_node_by_path("/cpus");
+	ret = add_node_props(fdt, cpus_offset, cpus_node);
+	of_node_put(cpus_node);
+	if (ret < 0)
+		return ret;
+
+	/* Loop through all subnodes of cpus and add them to fdt */
+	for_each_node_by_type(dn, "cpu") {
+		cpus_subnode_offset = fdt_add_subnode(fdt, cpus_offset, dn->full_name);
+		if (cpus_subnode_offset < 0) {
+			pr_err("Unable to add %s subnode: %s\n", dn->full_name,
+			       fdt_strerror(cpus_subnode_offset));
+			ret = cpus_subnode_offset;
+			goto out;
+		}
+
+		ret = add_node_props(fdt, cpus_subnode_offset, dn);
+		if (ret < 0)
+			goto out;
+	}
+out:
+	of_node_put(dn);
+	return ret;
+}
+#endif /* CONFIG_KEXEC_FILE || CONFIG_CRASH_DUMP */

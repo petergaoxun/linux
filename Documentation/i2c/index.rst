@@ -17,6 +17,8 @@ Introduction
    busses/index
    i2c-topology
    muxes/i2c-mux-gpio
+   i2c-sysfs
+   i2c-address-translators
 
 Writing device drivers
 ======================
@@ -47,6 +49,7 @@ Slave I2C
 
    slave-interface
    slave-eeprom-backend
+   slave-testunit-backend
 
 Advanced topics
 ===============
@@ -62,7 +65,6 @@ Legacy documentation
 .. toctree::
    :maxdepth: 1
 
-   upgrading-clients
    old-module-parameters
 
 .. only::  subproject and html

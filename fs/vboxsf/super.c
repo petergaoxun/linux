@@ -21,10 +21,7 @@
 
 #define VBOXSF_SUPER_MAGIC 0x786f4256 /* 'VBox' little endian */
 
-#define VBSF_MOUNT_SIGNATURE_BYTE_0 ('\000')
-#define VBSF_MOUNT_SIGNATURE_BYTE_1 ('\377')
-#define VBSF_MOUNT_SIGNATURE_BYTE_2 ('\376')
-#define VBSF_MOUNT_SIGNATURE_BYTE_3 ('\375')
+static const unsigned char VBSF_MOUNT_SIGNATURE[4] = "\000\377\376\375";
 
 static int follow_symlinks;
 module_param(follow_symlinks, int, 0444);
@@ -154,19 +151,21 @@ static int vboxsf_fill_super(struct super_block *sb, struct fs_context *fc)
 		if (!sbi->nls) {
 			vbg_err("vboxsf: Count not load '%s' nls\n", nls_name);
 			err = -EINVAL;
-			goto fail_free;
+			goto fail_destroy_idr;
 		}
 	}
 
-	sbi->bdi_id = ida_simple_get(&vboxsf_bdi_ida, 0, 0, GFP_KERNEL);
+	sbi->bdi_id = ida_alloc(&vboxsf_bdi_ida, GFP_KERNEL);
 	if (sbi->bdi_id < 0) {
 		err = sbi->bdi_id;
 		goto fail_free;
 	}
 
-	err = super_setup_bdi_name(sb, "vboxsf-%s.%d", fc->source, sbi->bdi_id);
+	err = super_setup_bdi_name(sb, "vboxsf-%d", sbi->bdi_id);
 	if (err)
 		goto fail_free;
+	sb->s_bdi->ra_pages = 0;
+	sb->s_bdi->io_pages = 0;
 
 	/* Turn source into a shfl_string and map the folder */
 	size = strlen(fc->source) + 1;
@@ -177,7 +176,7 @@ static int vboxsf_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 	folder_name->size = size;
 	folder_name->length = size - 1;
-	strlcpy(folder_name->string.utf8, fc->source, size);
+	strscpy(folder_name->string.utf8, fc->source, size);
 	err = vboxsf_map_folder(folder_name, &sbi->root);
 	kfree(folder_name);
 	if (err) {
@@ -205,7 +204,7 @@ static int vboxsf_fill_super(struct super_block *sb, struct fs_context *fc)
 		err = -ENOMEM;
 		goto fail_unmap;
 	}
-	vboxsf_init_inode(sbi, iroot, &sbi->root_info);
+	vboxsf_init_inode(sbi, iroot, &sbi->root_info, false);
 	unlock_new_inode(iroot);
 
 	droot = d_make_root(iroot);
@@ -222,9 +221,10 @@ fail_unmap:
 	vboxsf_unmap_folder(sbi->root);
 fail_free:
 	if (sbi->bdi_id >= 0)
-		ida_simple_remove(&vboxsf_bdi_ida, sbi->bdi_id);
+		ida_free(&vboxsf_bdi_ida, sbi->bdi_id);
 	if (sbi->nls)
 		unload_nls(sbi->nls);
+fail_destroy_idr:
 	idr_destroy(&sbi->ino_idr);
 	kfree(sbi);
 	return err;
@@ -242,7 +242,7 @@ static struct inode *vboxsf_alloc_inode(struct super_block *sb)
 {
 	struct vboxsf_inode *sf_i;
 
-	sf_i = kmem_cache_alloc(vboxsf_inode_cachep, GFP_NOFS);
+	sf_i = alloc_inode_sb(sb, vboxsf_inode_cachep, GFP_NOFS);
 	if (!sf_i)
 		return NULL;
 
@@ -269,7 +269,7 @@ static void vboxsf_put_super(struct super_block *sb)
 
 	vboxsf_unmap_folder(sbi->root);
 	if (sbi->bdi_id >= 0)
-		ida_simple_remove(&vboxsf_bdi_ida, sbi->bdi_id);
+		ida_free(&vboxsf_bdi_ida, sbi->bdi_id);
 	if (sbi->nls)
 		unload_nls(sbi->nls);
 
@@ -340,8 +340,7 @@ static int vboxsf_setup(void)
 	vboxsf_inode_cachep =
 		kmem_cache_create("vboxsf_inode_cache",
 				  sizeof(struct vboxsf_inode), 0,
-				  (SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD |
-				   SLAB_ACCOUNT),
+				  SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
 				  vboxsf_inode_init_once);
 	if (!vboxsf_inode_cachep) {
 		err = -ENOMEM;
@@ -384,12 +383,7 @@ fail_nomem:
 
 static int vboxsf_parse_monolithic(struct fs_context *fc, void *data)
 {
-	char *options = data;
-
-	if (options && options[0] == VBSF_MOUNT_SIGNATURE_BYTE_0 &&
-		       options[1] == VBSF_MOUNT_SIGNATURE_BYTE_1 &&
-		       options[2] == VBSF_MOUNT_SIGNATURE_BYTE_2 &&
-		       options[3] == VBSF_MOUNT_SIGNATURE_BYTE_3) {
+	if (data && !memcmp(data, VBSF_MOUNT_SIGNATURE, 4)) {
 		vbg_err("vboxsf: Old binary mount data not supported, remove obsolete mount.vboxsf and/or update your VBoxService.\n");
 		return -EINVAL;
 	}
@@ -416,7 +410,7 @@ static int vboxsf_reconfigure(struct fs_context *fc)
 
 	/* Apply changed options to the root inode */
 	sbi->o = ctx->o;
-	vboxsf_init_inode(sbi, iroot, &sbi->root_info);
+	vboxsf_init_inode(sbi, iroot, &sbi->root_info, true);
 
 	return 0;
 }

@@ -16,10 +16,6 @@
 #include "../kselftest.h"
 #include "clone3_selftests.h"
 
-#ifndef CLONE_CLEAR_SIGHAND
-#define CLONE_CLEAR_SIGHAND 0x100000000ULL
-#endif
-
 static void nop_handler(int signo)
 {
 }
@@ -47,7 +43,7 @@ static void test_clone3_clear_sighand(void)
 {
 	int ret;
 	pid_t pid;
-	struct clone_args args = {};
+	struct __clone_args args = {};
 	struct sigaction act;
 
 	/*
@@ -119,11 +115,10 @@ static void test_clone3_clear_sighand(void)
 int main(int argc, char **argv)
 {
 	ksft_print_header();
-	test_clone3_supported();
-
 	ksft_set_plan(1);
+	test_clone3_supported();
 
 	test_clone3_clear_sighand();
 
-	return ksft_exit_pass();
+	ksft_exit_pass();
 }

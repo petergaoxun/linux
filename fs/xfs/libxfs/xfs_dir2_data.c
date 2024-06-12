@@ -18,6 +18,7 @@
 #include "xfs_trans.h"
 #include "xfs_buf_item.h"
 #include "xfs_log.h"
+#include "xfs_health.h"
 
 static xfs_failaddr_t xfs_dir2_data_freefind_verify(
 		struct xfs_dir2_data_hdr *hdr, struct xfs_dir2_data_free *bf,
@@ -29,7 +30,7 @@ xfs_dir2_data_bestfree_p(
 	struct xfs_mount		*mp,
 	struct xfs_dir2_data_hdr	*hdr)
 {
-	if (xfs_sb_version_hascrc(&mp->m_sb))
+	if (xfs_has_crc(mp))
 		return ((struct xfs_dir3_data_hdr *)hdr)->best_free;
 	return hdr->bestfree;
 }
@@ -51,7 +52,7 @@ xfs_dir2_data_get_ftype(
 	struct xfs_mount		*mp,
 	struct xfs_dir2_data_entry	*dep)
 {
-	if (xfs_sb_version_hasftype(&mp->m_sb)) {
+	if (xfs_has_ftype(mp)) {
 		uint8_t			ftype = dep->name[dep->namelen];
 
 		if (likely(ftype < XFS_DIR3_FT_MAX))
@@ -70,7 +71,7 @@ xfs_dir2_data_put_ftype(
 	ASSERT(ftype < XFS_DIR3_FT_MAX);
 	ASSERT(dep->namelen != 0);
 
-	if (xfs_sb_version_hasftype(&mp->m_sb))
+	if (xfs_has_ftype(mp))
 		dep->name[dep->namelen] = ftype;
 }
 
@@ -218,7 +219,7 @@ __xfs_dir3_data_check(
 		 */
 		if (dep->namelen == 0)
 			return __this_address;
-		if (xfs_dir_ino_validate(mp, be64_to_cpu(dep->inumber)))
+		if (!xfs_verify_dir_ino(mp, be64_to_cpu(dep->inumber)))
 			return __this_address;
 		if (offset + xfs_dir2_data_entsize(mp, dep->namelen) > end)
 			return __this_address;
@@ -297,10 +298,10 @@ xfs_dir3_data_verify(
 	if (!xfs_verify_magic(bp, hdr3->magic))
 		return __this_address;
 
-	if (xfs_sb_version_hascrc(&mp->m_sb)) {
+	if (xfs_has_crc(mp)) {
 		if (!uuid_equal(&hdr3->uuid, &mp->m_sb.sb_meta_uuid))
 			return __this_address;
-		if (be64_to_cpu(hdr3->blkno) != bp->b_bn)
+		if (be64_to_cpu(hdr3->blkno) != xfs_buf_daddr(bp))
 			return __this_address;
 		if (!xfs_log_check_lsn(mp, be64_to_cpu(hdr3->lsn)))
 			return __this_address;
@@ -343,7 +344,7 @@ xfs_dir3_data_read_verify(
 	struct xfs_mount	*mp = bp->b_mount;
 	xfs_failaddr_t		fa;
 
-	if (xfs_sb_version_hascrc(&mp->m_sb) &&
+	if (xfs_has_crc(mp) &&
 	    !xfs_buf_verify_cksum(bp, XFS_DIR3_DATA_CRC_OFF))
 		xfs_verifier_error(bp, -EFSBADCRC, __this_address);
 	else {
@@ -368,7 +369,7 @@ xfs_dir3_data_write_verify(
 		return;
 	}
 
-	if (!xfs_sb_version_hascrc(&mp->m_sb))
+	if (!xfs_has_crc(mp))
 		return;
 
 	if (bip)
@@ -394,21 +395,54 @@ static const struct xfs_buf_ops xfs_dir3_data_reada_buf_ops = {
 	.verify_write = xfs_dir3_data_write_verify,
 };
 
+xfs_failaddr_t
+xfs_dir3_data_header_check(
+	struct xfs_buf		*bp,
+	xfs_ino_t		owner)
+{
+	struct xfs_mount	*mp = bp->b_mount;
+
+	if (xfs_has_crc(mp)) {
+		struct xfs_dir3_data_hdr *hdr3 = bp->b_addr;
+
+		if (hdr3->hdr.magic != cpu_to_be32(XFS_DIR3_DATA_MAGIC))
+			return __this_address;
+
+		if (be64_to_cpu(hdr3->hdr.owner) != owner)
+			return __this_address;
+	}
+
+	return NULL;
+}
 
 int
 xfs_dir3_data_read(
 	struct xfs_trans	*tp,
 	struct xfs_inode	*dp,
+	xfs_ino_t		owner,
 	xfs_dablk_t		bno,
 	unsigned int		flags,
 	struct xfs_buf		**bpp)
 {
+	xfs_failaddr_t		fa;
 	int			err;
 
 	err = xfs_da_read_buf(tp, dp, bno, flags, bpp, XFS_DATA_FORK,
 			&xfs_dir3_data_buf_ops);
-	if (!err && tp && *bpp)
-		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_DATA_BUF);
+	if (err || !*bpp)
+		return err;
+
+	/* Check things that we can't do in the verifier. */
+	fa = xfs_dir3_data_header_check(*bpp, owner);
+	if (fa) {
+		__xfs_buf_mark_corrupt(*bpp, fa);
+		xfs_trans_brelse(tp, *bpp);
+		*bpp = NULL;
+		xfs_dirattr_mark_sick(dp, XFS_DATA_FORK);
+		return -EFSCORRUPTED;
+	}
+
+	xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_DATA_BUF);
 	return err;
 }
 
@@ -689,13 +723,13 @@ xfs_dir3_data_init(
 	 * Initialize the header.
 	 */
 	hdr = bp->b_addr;
-	if (xfs_sb_version_hascrc(&mp->m_sb)) {
+	if (xfs_has_crc(mp)) {
 		struct xfs_dir3_blk_hdr *hdr3 = bp->b_addr;
 
 		memset(hdr3, 0, sizeof(*hdr3));
 		hdr3->magic = cpu_to_be32(XFS_DIR3_DATA_MAGIC);
-		hdr3->blkno = cpu_to_be64(bp->b_bn);
-		hdr3->owner = cpu_to_be64(dp->i_ino);
+		hdr3->blkno = cpu_to_be64(xfs_buf_daddr(bp));
+		hdr3->owner = cpu_to_be64(args->owner);
 		uuid_copy(&hdr3->uuid, &mp->m_sb.sb_meta_uuid);
 
 	} else
@@ -1170,6 +1204,7 @@ xfs_dir2_data_use_free(
 corrupt:
 	xfs_corruption_error(__func__, XFS_ERRLEVEL_LOW, args->dp->i_mount,
 			hdr, sizeof(*hdr), __FILE__, __LINE__, fa);
+	xfs_da_mark_sick(args);
 	return -EFSCORRUPTED;
 }
 

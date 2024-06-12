@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2013 - 2014 Texas Instruments Incorporated - http://www.ti.com
+ * Copyright (C) 2013 - 2014 Texas Instruments Incorporated - https://www.ti.com
  *
  * Authors:
  *    Jyri Sarha <jsarha@ti.com>
@@ -15,8 +15,8 @@
 #include <linux/gpio/consumer.h>
 #include <linux/err.h>
 #include <linux/device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/of_device.h>
 
 /**
  * DOC: basic gpio gated clock which can be enabled and disabled

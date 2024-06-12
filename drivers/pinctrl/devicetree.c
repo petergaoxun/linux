@@ -17,17 +17,18 @@
  * struct pinctrl_dt_map - mapping table chunk parsed from device tree
  * @node: list node for struct pinctrl's @dt_maps field
  * @pctldev: the pin controller that allocated this struct, and will free it
- * @maps: the mapping table entries
+ * @map: the mapping table entries
+ * @num_maps: number of mapping table entries
  */
 struct pinctrl_dt_map {
 	struct list_head node;
 	struct pinctrl_dev *pctldev;
 	struct pinctrl_map *map;
-	unsigned num_maps;
+	unsigned int num_maps;
 };
 
 static void dt_free_map(struct pinctrl_dev *pctldev,
-		     struct pinctrl_map *map, unsigned num_maps)
+			struct pinctrl_map *map, unsigned int num_maps)
 {
 	int i;
 
@@ -63,7 +64,7 @@ void pinctrl_dt_free_maps(struct pinctrl *p)
 
 static int dt_remember_or_free_map(struct pinctrl *p, const char *statename,
 				   struct pinctrl_dev *pctldev,
-				   struct pinctrl_map *map, unsigned num_maps)
+				   struct pinctrl_map *map, unsigned int num_maps)
 {
 	int i;
 	struct pinctrl_dt_map *dt_map;
@@ -103,6 +104,7 @@ struct pinctrl_dev *of_pinctrl_get(struct device_node *np)
 {
 	return get_pinctrl_dev_from_of_node(np);
 }
+EXPORT_SYMBOL_GPL(of_pinctrl_get);
 
 static int dt_to_map_one_config(struct pinctrl *p,
 				struct pinctrl_dev *hog_pctldev,
@@ -114,7 +116,7 @@ static int dt_to_map_one_config(struct pinctrl *p,
 	const struct pinctrl_ops *ops;
 	int ret;
 	struct pinctrl_map *map;
-	unsigned num_maps;
+	unsigned int num_maps;
 	bool allow_default = false;
 
 	/* Find the pin controller containing np_config */
@@ -127,11 +129,11 @@ static int dt_to_map_one_config(struct pinctrl *p,
 		np_pctldev = of_get_next_parent(np_pctldev);
 		if (!np_pctldev || of_node_is_root(np_pctldev)) {
 			of_node_put(np_pctldev);
-			/* keep deferring if modules are enabled unless we've timed out */
-			if (IS_ENABLED(CONFIG_MODULES) && !allow_default)
-				return driver_deferred_probe_check_state_continue(p->dev);
-
-			return driver_deferred_probe_check_state(p->dev);
+			ret = -ENODEV;
+			/* keep deferring if modules are enabled */
+			if (IS_ENABLED(CONFIG_MODULES) && !allow_default && ret < 0)
+				ret = -EPROBE_DEFER;
+			return ret;
 		}
 		/* If we're creating a hog we can use the passed pctldev */
 		if (hog_pctldev && (np_pctldev == p->dev->of_node)) {
@@ -218,12 +220,16 @@ int pinctrl_dt_to_map(struct pinctrl *p, struct pinctrl_dev *pctldev)
 	for (state = 0; ; state++) {
 		/* Retrieve the pinctrl-* property */
 		propname = kasprintf(GFP_KERNEL, "pinctrl-%d", state);
+		if (!propname) {
+			ret = -ENOMEM;
+			goto err;
+		}
 		prop = of_find_property(np, propname, &size);
 		kfree(propname);
 		if (!prop) {
 			if (state == 0) {
-				of_node_put(np);
-				return -ENODEV;
+				ret = -ENODEV;
+				goto err;
 			}
 			break;
 		}
@@ -395,7 +401,7 @@ static int pinctrl_copy_args(const struct device_node *np,
  * @np: pointer to device node with the property
  * @list_name: property that contains the list
  * @index: index within the list
- * @out_arts: entries in the list pointed by index
+ * @out_args: entries in the list pointed by index
  *
  * Finds the selected element in a pinctrl array consisting of an index
  * within the controller and a number of u32 entries specified for each

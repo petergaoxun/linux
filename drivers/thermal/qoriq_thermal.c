@@ -3,17 +3,16 @@
 // Copyright 2016 Freescale Semiconductor, Inc.
 
 #include <linux/clk.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
+#include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/thermal.h>
+#include <linux/units.h>
 
-#include "thermal_core.h"
 #include "thermal_hwmon.h"
 
 #define SITES_MAX		16
@@ -24,6 +23,7 @@
 #define TMTMIR_DEFAULT	0x0000000f
 #define TIER_DISABLE	0x0
 #define TEUMR0_V2		0x51009c00
+#define TMSARA_V2		0xe
 #define TMU_VER1		0x1
 #define TMU_VER2		0x2
 
@@ -31,7 +31,6 @@
 #define TMR_DISABLE	0x0
 #define TMR_ME		0x80000000
 #define TMR_ALPF	0x0c000000
-#define TMR_MSITE_ALL	GENMASK(15, 0)
 
 #define REGS_TMTMIR	0x008	/* Temperature measurement interval Register */
 #define TMTMIR_DEFAULT	0x0000000f
@@ -51,9 +50,16 @@
 					    * Site Register
 					    */
 #define TRITSR_V	BIT(31)
+#define TRITSR_TP5	BIT(9)
+#define REGS_V2_TMSAR(n)	(0x304 + 16 * (n))	/* TMU monitoring
+						* site adjustment register
+						*/
 #define REGS_TTRnCR(n)	(0xf10 + 4 * (n)) /* Temperature Range n
 					   * Control Register
 					   */
+#define NUM_TTRCR_V1	4
+#define NUM_TTRCR_MAX	16
+
 #define REGS_IPBRR(n)		(0xbf8 + 4 * (n)) /* IP Block Revision
 						   * Register n
 						   */
@@ -68,6 +74,7 @@ struct qoriq_sensor {
 
 struct qoriq_tmu_data {
 	int ver;
+	u32 ttrcr[NUM_TTRCR_MAX];
 	struct regmap *regmap;
 	struct clk *clk;
 	struct qoriq_sensor	sensor[SITES_MAX];
@@ -78,21 +85,35 @@ static struct qoriq_tmu_data *qoriq_sensor_to_data(struct qoriq_sensor *s)
 	return container_of(s, struct qoriq_tmu_data, sensor[s->id]);
 }
 
-static int tmu_get_temp(void *p, int *temp)
+static int tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 {
-	struct qoriq_sensor *qsensor = p;
+	struct qoriq_sensor *qsensor = thermal_zone_device_priv(tz);
 	struct qoriq_tmu_data *qdata = qoriq_sensor_to_data(qsensor);
 	u32 val;
 	/*
 	 * REGS_TRITSR(id) has the following layout:
 	 *
+	 * For TMU Rev1:
 	 * 31  ... 7 6 5 4 3 2 1 0
 	 *  V          TEMP
 	 *
 	 * Where V bit signifies if the measurement is ready and is
 	 * within sensor range. TEMP is an 8 bit value representing
-	 * temperature in C.
+	 * temperature in Celsius.
+
+	 * For TMU Rev2:
+	 * 31  ... 8 7 6 5 4 3 2 1 0
+	 *  V          TEMP
+	 *
+	 * Where V bit signifies if the measurement is ready and is
+	 * within sensor range. TEMP is an 9 bit value representing
+	 * temperature in KelVin.
 	 */
+
+	regmap_read(qdata->regmap, REGS_TMR, &val);
+	if (!(val & TMR_ME))
+		return -EAGAIN;
+
 	if (regmap_read_poll_timeout(qdata->regmap,
 				     REGS_TRITSR(qsensor->id),
 				     val,
@@ -101,27 +122,27 @@ static int tmu_get_temp(void *p, int *temp)
 				     10 * USEC_PER_MSEC))
 		return -ENODATA;
 
-	*temp = (val & 0xff) * 1000;
+	if (qdata->ver == TMU_VER1) {
+		*temp = (val & GENMASK(7, 0)) * MILLIDEGREE_PER_DEGREE;
+	} else {
+		if (val & TRITSR_TP5)
+			*temp = milli_kelvin_to_millicelsius((val & GENMASK(8, 0)) *
+							     MILLIDEGREE_PER_DEGREE + 500);
+		else
+			*temp = kelvin_to_millicelsius(val & GENMASK(8, 0));
+	}
 
 	return 0;
 }
 
-static const struct thermal_zone_of_device_ops tmu_tz_ops = {
+static const struct thermal_zone_device_ops tmu_tz_ops = {
 	.get_temp = tmu_get_temp,
 };
 
 static int qoriq_tmu_register_tmu_zone(struct device *dev,
 				       struct qoriq_tmu_data *qdata)
 {
-	int id;
-
-	if (qdata->ver == TMU_VER1) {
-		regmap_write(qdata->regmap, REGS_TMR,
-			     TMR_MSITE_ALL | TMR_ME | TMR_ALPF);
-	} else {
-		regmap_write(qdata->regmap, REGS_V2_TMSR, TMR_MSITE_ALL);
-		regmap_write(qdata->regmap, REGS_TMR, TMR_ME | TMR_ALPF_V2);
-	}
+	int id, sites = 0;
 
 	for (id = 0; id < SITES_MAX; id++) {
 		struct thermal_zone_device *tzd;
@@ -130,22 +151,32 @@ static int qoriq_tmu_register_tmu_zone(struct device *dev,
 
 		sensor->id = id;
 
-		tzd = devm_thermal_zone_of_sensor_register(dev, id,
-							   sensor,
-							   &tmu_tz_ops);
+		tzd = devm_thermal_of_zone_register(dev, id,
+						    sensor,
+						    &tmu_tz_ops);
 		ret = PTR_ERR_OR_ZERO(tzd);
 		if (ret) {
 			if (ret == -ENODEV)
 				continue;
 
-			regmap_write(qdata->regmap, REGS_TMR, TMR_DISABLE);
 			return ret;
 		}
 
-		if (devm_thermal_add_hwmon_sysfs(tzd))
-			dev_warn(dev,
-				 "Failed to add hwmon sysfs attributes\n");
+		if (qdata->ver == TMU_VER1)
+			sites |= 0x1 << (15 - id);
+		else
+			sites |= 0x1 << id;
 
+		devm_thermal_add_hwmon_sysfs(dev, tzd);
+	}
+
+	if (sites) {
+		if (qdata->ver == TMU_VER1) {
+			regmap_write(qdata->regmap, REGS_TMR, TMR_ME | TMR_ALPF | sites);
+		} else {
+			regmap_write(qdata->regmap, REGS_V2_TMSR, sites);
+			regmap_write(qdata->regmap, REGS_TMR, TMR_ME | TMR_ALPF_V2);
+		}
 	}
 
 	return 0;
@@ -155,17 +186,17 @@ static int qoriq_tmu_calibration(struct device *dev,
 				 struct qoriq_tmu_data *data)
 {
 	int i, val, len;
-	u32 range[4];
 	const u32 *calibration;
 	struct device_node *np = dev->of_node;
 
 	len = of_property_count_u32_elems(np, "fsl,tmu-range");
-	if (len < 0 || len > 4) {
+	if (len < 0 || (data->ver == TMU_VER1 && len > NUM_TTRCR_V1) ||
+	    (data->ver > TMU_VER1 && len > NUM_TTRCR_MAX)) {
 		dev_err(dev, "invalid range data.\n");
 		return len;
 	}
 
-	val = of_property_read_u32_array(np, "fsl,tmu-range", range, len);
+	val = of_property_read_u32_array(np, "fsl,tmu-range", data->ttrcr, len);
 	if (val != 0) {
 		dev_err(dev, "failed to read range data.\n");
 		return val;
@@ -173,7 +204,7 @@ static int qoriq_tmu_calibration(struct device *dev,
 
 	/* Init temperature range registers */
 	for (i = 0; i < len; i++)
-		regmap_write(data->regmap, REGS_TTRnCR(i), range[i]);
+		regmap_write(data->regmap, REGS_TTRnCR(i), data->ttrcr[i]);
 
 	calibration = of_get_property(np, "fsl,tmu-calibration", &len);
 	if (calibration == NULL || len % 8) {
@@ -211,8 +242,9 @@ static void qoriq_tmu_init_device(struct qoriq_tmu_data *data)
 
 static const struct regmap_range qoriq_yes_ranges[] = {
 	regmap_reg_range(REGS_TMR, REGS_TSCFGR),
-	regmap_reg_range(REGS_TTRnCR(0), REGS_TTRnCR(3)),
+	regmap_reg_range(REGS_TTRnCR(0), REGS_TTRnCR(15)),
 	regmap_reg_range(REGS_V2_TEUMR(0), REGS_V2_TEUMR(2)),
+	regmap_reg_range(REGS_V2_TMSAR(0), REGS_V2_TMSAR(15)),
 	regmap_reg_range(REGS_IPBRR(0), REGS_IPBRR(1)),
 	/* Read only registers below */
 	regmap_reg_range(REGS_TRITSR(0), REGS_TRITSR(15)),
@@ -227,6 +259,14 @@ static const struct regmap_access_table qoriq_rd_table = {
 	.yes_ranges	= qoriq_yes_ranges,
 	.n_yes_ranges	= ARRAY_SIZE(qoriq_yes_ranges),
 };
+
+static void qoriq_tmu_action(void *p)
+{
+	struct qoriq_tmu_data *data = p;
+
+	regmap_write(data->regmap, REGS_TMR, TMR_DISABLE);
+	clk_disable_unprepare(data->clk);
+}
 
 static int qoriq_tmu_probe(struct platform_device *pdev)
 {
@@ -278,6 +318,10 @@ static int qoriq_tmu_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = devm_add_action_or_reset(dev, qoriq_tmu_action, data);
+	if (ret)
+		return ret;
+
 	/* version register offset at: 0xbf8 on both v1 and v2 */
 	ret = regmap_read(data->regmap, REGS_IPBRR(0), &ver);
 	if (ret) {
@@ -290,33 +334,15 @@ static int qoriq_tmu_probe(struct platform_device *pdev)
 
 	ret = qoriq_tmu_calibration(dev, data);	/* TMU calibration */
 	if (ret < 0)
-		goto err;
+		return ret;
 
 	ret = qoriq_tmu_register_tmu_zone(dev, data);
 	if (ret < 0) {
 		dev_err(dev, "Failed to register sensors\n");
-		ret = -ENODEV;
-		goto err;
+		return ret;
 	}
 
 	platform_set_drvdata(pdev, data);
-
-	return 0;
-
-err:
-	clk_disable_unprepare(data->clk);
-
-	return ret;
-}
-
-static int qoriq_tmu_remove(struct platform_device *pdev)
-{
-	struct qoriq_tmu_data *data = platform_get_drvdata(pdev);
-
-	/* Disable monitoring */
-	regmap_write(data->regmap, REGS_TMR, TMR_DISABLE);
-
-	clk_disable_unprepare(data->clk);
 
 	return 0;
 }
@@ -365,7 +391,6 @@ static struct platform_driver qoriq_tmu = {
 		.of_match_table	= qoriq_tmu_match,
 	},
 	.probe	= qoriq_tmu_probe,
-	.remove	= qoriq_tmu_remove,
 };
 module_platform_driver(qoriq_tmu);
 

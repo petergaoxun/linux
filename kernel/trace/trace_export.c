@@ -26,7 +26,7 @@ static int ftrace_event_register(struct trace_event_call *call,
 
 /*
  * The FTRACE_ENTRY_REG macro allows ftrace entry to define register
- * function and thus become accesible via perf.
+ * function and thus become accessible via perf.
  */
 #undef FTRACE_ENTRY_REG
 #define FTRACE_ENTRY_REG(name, struct_name, id, tstruct, print, regfn) \
@@ -45,8 +45,14 @@ static int ftrace_event_register(struct trace_event_call *call,
 #undef __field_desc
 #define __field_desc(type, container, item)		type item;
 
+#undef __field_packed
+#define __field_packed(type, container, item)		type item;
+
 #undef __array
 #define __array(type, item, size)			type item[size];
+
+#undef __stack_array
+#define __stack_array(type, item, size, field)		__array(type, item, size)
 
 #undef __array_desc
 #define __array_desc(type, container, item, size)	type item[size];
@@ -85,6 +91,13 @@ static void __always_unused ____ftrace_check_##name(void)		\
 	.size = sizeof(_type), .align = __alignof__(_type),		\
 	is_signed_type(_type), .filter_type = _filter_type },
 
+
+#undef __field_ext_packed
+#define __field_ext_packed(_type, _item, _filter_type) {	\
+	.type = #_type, .name = #_item,				\
+	.size = sizeof(_type), .align = 1,			\
+	is_signed_type(_type), .filter_type = _filter_type },
+
 #undef __field
 #define __field(_type, _item) __field_ext(_type, _item, FILTER_OTHER)
 
@@ -94,11 +107,18 @@ static void __always_unused ____ftrace_check_##name(void)		\
 #undef __field_desc
 #define __field_desc(_type, _container, _item) __field_ext(_type, _item, FILTER_OTHER)
 
+#undef __field_packed
+#define __field_packed(_type, _container, _item) __field_ext_packed(_type, _item, FILTER_OTHER)
+
 #undef __array
 #define __array(_type, _item, _len) {					\
 	.type = #_type"["__stringify(_len)"]", .name = #_item,		\
 	.size = sizeof(_type[_len]), .align = __alignof__(_type),	\
-	is_signed_type(_type), .filter_type = FILTER_OTHER },
+	is_signed_type(_type), .filter_type = FILTER_OTHER,			\
+	.len = _len },
+
+#undef __stack_array
+#define __stack_array(_type, _item, _len, _field) __array(_type, _item, _len)
 
 #undef __array_desc
 #define __array_desc(_type, _container, _item, _len) __array(_type, _item, _len)
@@ -129,8 +149,14 @@ static struct trace_event_fields ftrace_event_fields_##name[] = {	\
 #undef __field_desc
 #define __field_desc(type, container, item)
 
+#undef __field_packed
+#define __field_packed(type, container, item)
+
 #undef __array
 #define __array(type, item, len)
+
+#undef __stack_array
+#define __stack_array(type, item, len, field)
 
 #undef __array_desc
 #define __array_desc(type, container, item, len)
@@ -160,7 +186,7 @@ struct trace_event_call __used event_##call = {				\
 	.flags			= TRACE_EVENT_FL_IGNORE_ENABLE,		\
 };									\
 static struct trace_event_call __used						\
-__attribute__((section("_ftrace_events"))) *__event_##call = &event_##call;
+__section("_ftrace_events") *__event_##call = &event_##call;
 
 #undef FTRACE_ENTRY
 #define FTRACE_ENTRY(call, struct_name, etype, tstruct, print)		\

@@ -6,7 +6,7 @@ Documentation subsystem maintainer entry profile
 The documentation "subsystem" is the central coordinating point for the
 kernel's documentation and associated infrastructure.  It covers the
 hierarchy under Documentation/ (with the exception of
-Documentation/device-tree), various utilities under scripts/ and, at least
+Documentation/devicetree), various utilities under scripts/ and, at least
 some of the time, LICENSES/.
 
 It's worth noting, though, that the boundaries of this subsystem are rather
@@ -26,6 +26,13 @@ When making documentation changes, you should actually build the
 documentation and ensure that no new errors or warnings have been
 introduced.  Generating HTML documents and looking at the result will help
 to avoid unsightly misunderstandings about how things will be rendered.
+
+All new documentation (including additions to existing documents) should
+ideally justify who the intended target audience is somewhere in the
+changelog; this way, we ensure that the documentation ends up in the correct
+place.  Some possible categories are: kernel developers (experts or
+beginners), userspace programmers, end users and/or system administrators,
+and distributors.
 
 Key cycle dates
 ---------------

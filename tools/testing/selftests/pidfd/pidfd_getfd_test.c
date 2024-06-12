@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/types.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -18,7 +19,6 @@
 #include <linux/kcmp.h>
 
 #include "pidfd.h"
-#include "../kselftest.h"
 #include "../kselftest_harness.h"
 
 /*
@@ -32,11 +32,6 @@ static int sys_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long idx1,
 		    unsigned long idx2)
 {
 	return syscall(__NR_kcmp, pid1, pid2, type, idx1, idx2);
-}
-
-static int sys_memfd_create(const char *name, unsigned int flags)
-{
-	return syscall(__NR_memfd_create, name, flags);
 }
 
 static int __child(int sk, int memfd)
@@ -135,6 +130,7 @@ FIXTURE(child)
 	 * When it is closed, the child will exit.
 	 */
 	int sk;
+	bool ignore_child_result;
 };
 
 FIXTURE_SETUP(child)
@@ -171,10 +167,14 @@ FIXTURE_SETUP(child)
 
 FIXTURE_TEARDOWN(child)
 {
+	int ret;
+
 	EXPECT_EQ(0, close(self->pidfd));
 	EXPECT_EQ(0, close(self->sk));
 
-	EXPECT_EQ(0, wait_for_pid(self->pid));
+	ret = wait_for_pid(self->pid);
+	if (!self->ignore_child_result)
+		EXPECT_EQ(0, ret);
 }
 
 TEST_F(child, disable_ptrace)
@@ -210,7 +210,10 @@ TEST_F(child, fetch_fd)
 	fd = sys_pidfd_getfd(self->pidfd, self->remote_fd, 0);
 	ASSERT_GE(fd, 0);
 
-	EXPECT_EQ(0, sys_kcmp(getpid(), self->pid, KCMP_FILE, fd, self->remote_fd));
+	ret = sys_kcmp(getpid(), self->pid, KCMP_FILE, fd, self->remote_fd);
+	if (ret < 0 && errno == ENOSYS)
+		SKIP(return, "kcmp() syscall not supported");
+	EXPECT_EQ(ret, 0);
 
 	ret = fcntl(fd, F_GETFD);
 	ASSERT_GE(ret, 0);
@@ -236,6 +239,29 @@ TEST(flags_set)
 {
 	ASSERT_EQ(-1, sys_pidfd_getfd(0, 0, 1));
 	EXPECT_EQ(errno, EINVAL);
+}
+
+TEST_F(child, no_strange_EBADF)
+{
+	struct pollfd fds;
+
+	self->ignore_child_result = true;
+
+	fds.fd = self->pidfd;
+	fds.events = POLLIN;
+
+	ASSERT_EQ(kill(self->pid, SIGKILL), 0);
+	ASSERT_EQ(poll(&fds, 1, 5000), 1);
+
+	/*
+	 * It used to be that pidfd_getfd() could race with the exiting thread
+	 * between exit_files() and release_task(), and get a non-null task
+	 * with a NULL files struct, and you'd get EBADF, which was slightly
+	 * confusing.
+	 */
+	errno = 0;
+	EXPECT_EQ(sys_pidfd_getfd(self->pidfd, self->remote_fd, 0), -1);
+	EXPECT_EQ(errno, ESRCH);
 }
 
 #if __NR_pidfd_getfd == -1

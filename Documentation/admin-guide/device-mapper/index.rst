@@ -11,7 +11,9 @@ Device Mapper
     dm-clone
     dm-crypt
     dm-dust
+    dm-ebs
     dm-flakey
+    dm-ima
     dm-init
     dm-integrity
     dm-io
@@ -32,6 +34,8 @@ Device Mapper
     switch
     thin-provisioning
     unstriped
+    vdo-design
+    vdo
     verity
     writecache
     zero

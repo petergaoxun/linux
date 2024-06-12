@@ -29,7 +29,7 @@ follows:
   - Does not support shared LDPC code table wraparound
 
 The device tree entry is described in:
-`linux-xlnx/Documentation/devicetree/bindings/misc/xlnx,sd-fec.txt <https://github.com/Xilinx/linux-xlnx/blob/master/Documentation/devicetree/bindings/misc/xlnx%2Csd-fec.txt>`_
+`linux-xlnx/Documentation/devicetree/bindings/misc/xlnx,sd-fec.yaml <https://github.com/Xilinx/linux-xlnx/blob/master/Documentation/devicetree/bindings/misc/xlnx%2Csd-fec.yaml>`_
 
 
 Modes of Operation
@@ -78,7 +78,7 @@ application interfaces:
   - open: Implements restriction that only a single file descriptor can be open per SD-FEC instance at any time
   - release: Allows another file descriptor to be open, that is after current file descriptor is closed
   - poll: Provides a method to monitor for SD-FEC Error events
-  - unlocked_ioctl: Provides the the following ioctl commands that allows the application configure the SD-FEC core:
+  - unlocked_ioctl: Provides the following ioctl commands that allows the application configure the SD-FEC core:
 
 		- :c:macro:`XSDFEC_START_DEV`
 		- :c:macro:`XSDFEC_STOP_DEV`

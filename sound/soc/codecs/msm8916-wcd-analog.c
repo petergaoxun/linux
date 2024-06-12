@@ -7,7 +7,6 @@
 #include <linux/delay.h>
 #include <linux/regulator/consumer.h>
 #include <linux/types.h>
-#include <linux/clk.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -19,8 +18,8 @@
 
 #define CDC_D_REVISION1			(0xf000)
 #define CDC_D_PERPH_SUBTYPE		(0xf005)
-#define CDC_D_INT_EN_SET		(0x015)
-#define CDC_D_INT_EN_CLR		(0x016)
+#define CDC_D_INT_EN_SET		(0xf015)
+#define CDC_D_INT_EN_CLR		(0xf016)
 #define MBHC_SWITCH_INT			BIT(7)
 #define MBHC_MIC_ELECTRICAL_INS_REM_DET	BIT(6)
 #define MBHC_BUTTON_PRESS_DET		BIT(5)
@@ -510,7 +509,7 @@ static void pm8916_wcd_setup_mbhc(struct pm8916_wcd_analog_priv *wcd)
 			    DIG_CLK_CTL_D_MBHC_CLK_EN_MASK,
 			    DIG_CLK_CTL_D_MBHC_CLK_EN);
 
-	if (snd_soc_component_read32(component, CDC_A_MICB_2_EN) & CDC_A_MICB_2_EN_ENABLE)
+	if (snd_soc_component_read(component, CDC_A_MICB_2_EN) & CDC_A_MICB_2_EN_ENABLE)
 		micbias_enabled = true;
 
 	pm8916_mbhc_configure_bias(wcd, micbias_enabled);
@@ -608,7 +607,7 @@ static int pm8916_wcd_analog_enable_adc(struct snd_soc_dapm_widget *w,
 		case CDC_A_TX_2_EN:
 			snd_soc_component_update_bits(component, CDC_A_MICB_1_CTL,
 					    MICB_1_CTL_CFILT_REF_SEL_MASK, 0);
-			/* fall through */
+			fallthrough;
 		case CDC_A_TX_3_EN:
 			snd_soc_component_update_bits(component, CDC_D_CDC_CONN_TX2_CTL,
 					    CONN_TX2_SERIAL_TX2_MUX,
@@ -730,8 +729,8 @@ static int pm8916_wcd_analog_probe(struct snd_soc_component *component)
 	snd_soc_component_init_regmap(component,
 				  dev_get_regmap(component->dev->parent, NULL));
 	snd_soc_component_set_drvdata(component, priv);
-	priv->pmic_rev = snd_soc_component_read32(component, CDC_D_REVISION1);
-	priv->codec_version = snd_soc_component_read32(component, CDC_D_PERPH_SUBTYPE);
+	priv->pmic_rev = snd_soc_component_read(component, CDC_D_REVISION1);
+	priv->codec_version = snd_soc_component_read(component, CDC_D_PERPH_SUBTYPE);
 
 	dev_info(component->dev, "PMIC REV: %d\t CODEC Version: %d\n",
 		 priv->pmic_rev, priv->codec_version);
@@ -822,8 +821,8 @@ static const struct snd_soc_dapm_route pm8916_wcd_analog_audio_map[] = {
 	{"EAR PA", NULL, "EAR CP"},
 
 	/* Headset (RX MIX1 and RX MIX2) */
-	{"HEADPHONE", NULL, "HPHL PA"},
-	{"HEADPHONE", NULL, "HPHR PA"},
+	{"HPH_L", NULL, "HPHL PA"},
+	{"HPH_R", NULL, "HPHR PA"},
 
 	{"HPHL DAC", NULL, "EAR_HPHL_CLK"},
 	{"HPHR DAC", NULL, "EAR_HPHR_CLK"},
@@ -870,7 +869,8 @@ static const struct snd_soc_dapm_widget pm8916_wcd_analog_dapm_widgets[] = {
 	SND_SOC_DAPM_INPUT("AMIC3"),
 	SND_SOC_DAPM_INPUT("AMIC2"),
 	SND_SOC_DAPM_OUTPUT("EAR"),
-	SND_SOC_DAPM_OUTPUT("HEADPHONE"),
+	SND_SOC_DAPM_OUTPUT("HPH_L"),
+	SND_SOC_DAPM_OUTPUT("HPH_R"),
 
 	/* RX stuff */
 	SND_SOC_DAPM_SUPPLY("INT_LDO_H", SND_SOC_NOPM, 1, 0, NULL, 0),
@@ -990,7 +990,7 @@ static irqreturn_t mbhc_btn_release_irq_handler(int irq, void *arg)
 
 	if (priv->detect_accessory_type) {
 		struct snd_soc_component *component = priv->component;
-		u32 val = snd_soc_component_read32(component, CDC_A_MBHC_RESULT_1);
+		u32 val = snd_soc_component_read(component, CDC_A_MBHC_RESULT_1);
 
 		/* check if its BTN0 thats released */
 		if ((val != -1) && !(val & CDC_A_MBHC_RESULT_1_BTN_RESULT_MASK))
@@ -1009,7 +1009,7 @@ static irqreturn_t mbhc_btn_press_irq_handler(int irq, void *arg)
 	struct snd_soc_component *component = priv->component;
 	u32 btn_result;
 
-	btn_result = snd_soc_component_read32(component, CDC_A_MBHC_RESULT_1) &
+	btn_result = snd_soc_component_read(component, CDC_A_MBHC_RESULT_1) &
 				  CDC_A_MBHC_RESULT_1_BTN_RESULT_MASK;
 
 	switch (btn_result) {
@@ -1046,7 +1046,7 @@ static irqreturn_t pm8916_mbhc_switch_irq_handler(int irq, void *arg)
 	struct snd_soc_component *component = priv->component;
 	bool ins = false;
 
-	if (snd_soc_component_read32(component, CDC_A_MBHC_DET_CTL_1) &
+	if (snd_soc_component_read(component, CDC_A_MBHC_DET_CTL_1) &
 				CDC_A_MBHC_DET_CTL_MECH_DET_TYPE_MASK)
 		ins = true;
 
@@ -1059,7 +1059,7 @@ static irqreturn_t pm8916_mbhc_switch_irq_handler(int irq, void *arg)
 	if (ins) { /* hs insertion */
 		bool micbias_enabled = false;
 
-		if (snd_soc_component_read32(component, CDC_A_MICB_2_EN) &
+		if (snd_soc_component_read(component, CDC_A_MICB_2_EN) &
 				CDC_A_MICB_2_EN_ENABLE)
 			micbias_enabled = true;
 
@@ -1127,7 +1127,6 @@ static const struct snd_soc_component_driver pm8916_wcd_analog = {
 	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
 	.endianness		= 1,
-	.non_legacy_dai_naming	= 1,
 };
 
 static int pm8916_wcd_analog_parse_dt(struct device *dev,
@@ -1198,12 +1197,6 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
-	priv->mclk = devm_clk_get(dev, "mclk");
-	if (IS_ERR(priv->mclk)) {
-		dev_err(dev, "failed to get mclk\n");
-		return PTR_ERR(priv->mclk);
-	}
-
 	for (i = 0; i < ARRAY_SIZE(supply_names); i++)
 		priv->supplies[i].supply = supply_names[i];
 
@@ -1211,12 +1204,6 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 				    priv->supplies);
 	if (ret) {
 		dev_err(dev, "Failed to get regulator supplies %d\n", ret);
-		return ret;
-	}
-
-	ret = clk_prepare_enable(priv->mclk);
-	if (ret < 0) {
-		dev_err(dev, "failed to enable mclk %d\n", ret);
 		return ret;
 	}
 
@@ -1229,8 +1216,10 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 			       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
 			       IRQF_ONESHOT,
 			       "mbhc switch irq", priv);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "cannot request mbhc switch irq\n");
+		return ret;
+	}
 
 	if (priv->mbhc_btn_enabled) {
 		irq = platform_get_irq_byname(pdev, "mbhc_but_press_det");
@@ -1242,8 +1231,10 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 				       IRQF_TRIGGER_RISING |
 				       IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 				       "mbhc btn press irq", priv);
-		if (ret)
+		if (ret) {
 			dev_err(dev, "cannot request mbhc button press irq\n");
+			return ret;
+		}
 
 		irq = platform_get_irq_byname(pdev, "mbhc_but_rel_det");
 		if (irq < 0)
@@ -1254,9 +1245,10 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 				       IRQF_TRIGGER_RISING |
 				       IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 				       "mbhc btn release irq", priv);
-		if (ret)
+		if (ret) {
 			dev_err(dev, "cannot request mbhc button release irq\n");
-
+			return ret;
+		}
 	}
 
 	dev_set_drvdata(dev, priv);
@@ -1264,15 +1256,6 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 	return devm_snd_soc_register_component(dev, &pm8916_wcd_analog,
 				      pm8916_wcd_analog_dai,
 				      ARRAY_SIZE(pm8916_wcd_analog_dai));
-}
-
-static int pm8916_wcd_analog_spmi_remove(struct platform_device *pdev)
-{
-	struct pm8916_wcd_analog_priv *priv = dev_get_drvdata(&pdev->dev);
-
-	clk_disable_unprepare(priv->mclk);
-
-	return 0;
 }
 
 static const struct of_device_id pm8916_wcd_analog_spmi_match_table[] = {
@@ -1288,7 +1271,6 @@ static struct platform_driver pm8916_wcd_analog_spmi_driver = {
 		   .of_match_table = pm8916_wcd_analog_spmi_match_table,
 	},
 	.probe = pm8916_wcd_analog_spmi_probe,
-	.remove = pm8916_wcd_analog_spmi_remove,
 };
 
 module_platform_driver(pm8916_wcd_analog_spmi_driver);

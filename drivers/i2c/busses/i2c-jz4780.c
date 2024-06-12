@@ -18,7 +18,7 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -77,25 +77,6 @@
 #define JZ4780_I2C_STA_ACT		BIT(0)
 
 #define X1000_I2C_DC_STOP		BIT(9)
-
-static const char * const jz4780_i2c_abrt_src[] = {
-	"ABRT_7B_ADDR_NOACK",
-	"ABRT_10ADDR1_NOACK",
-	"ABRT_10ADDR2_NOACK",
-	"ABRT_XDATA_NOACK",
-	"ABRT_GCALL_NOACK",
-	"ABRT_GCALL_READ",
-	"ABRT_HS_ACKD",
-	"SBYTE_ACKDET",
-	"ABRT_HS_NORSTRT",
-	"SBYTE_NORSTRT",
-	"ABRT_10B_RD_NORSTRT",
-	"ABRT_MASTER_DIS",
-	"ARB_LOST",
-	"SLVFLUSH_TXFIFO",
-	"SLV_ARBLOST",
-	"SLVRD_INTX",
-};
 
 #define JZ4780_I2C_INTST_IGC		BIT(11)
 #define JZ4780_I2C_INTST_ISTT		BIT(10)
@@ -456,9 +437,8 @@ static irqreturn_t jz4780_i2c_irq(int irqno, void *dev_id)
 	unsigned short intst;
 	unsigned short intmsk;
 	struct jz4780_i2c *i2c = dev_id;
-	unsigned long flags;
 
-	spin_lock_irqsave(&i2c->lock, flags);
+	spin_lock(&i2c->lock);
 	intmsk = jz4780_i2c_readw(i2c, JZ4780_I2C_INTM);
 	intst = jz4780_i2c_readw(i2c, JZ4780_I2C_INTST);
 
@@ -545,8 +525,8 @@ static irqreturn_t jz4780_i2c_irq(int irqno, void *dev_id)
 				i2c_sta = jz4780_i2c_readw(i2c, JZ4780_I2C_STA);
 				data = *i2c->wbuf;
 				data &= ~JZ4780_I2C_DC_READ;
-				if ((!i2c->stop_hold) && (i2c->cdata->version >=
-						ID_X1000))
+				if ((i2c->wt_len == 1) && (!i2c->stop_hold) &&
+						(i2c->cdata->version >= ID_X1000))
 					data |= X1000_I2C_DC_STOP;
 				jz4780_i2c_writew(i2c, JZ4780_I2C_DC, data);
 				i2c->wbuf++;
@@ -570,27 +550,14 @@ static irqreturn_t jz4780_i2c_irq(int irqno, void *dev_id)
 	}
 
 done:
-	spin_unlock_irqrestore(&i2c->lock, flags);
+	spin_unlock(&i2c->lock);
 	return IRQ_HANDLED;
 }
 
 static void jz4780_i2c_txabrt(struct jz4780_i2c *i2c, int src)
 {
-	int i;
-
-	dev_err(&i2c->adap.dev, "txabrt: 0x%08x\n", src);
-	dev_err(&i2c->adap.dev, "device addr=%x\n",
-		jz4780_i2c_readw(i2c, JZ4780_I2C_TAR));
-	dev_err(&i2c->adap.dev, "send cmd count:%d  %d\n",
-		i2c->cmd, i2c->cmd_buf[i2c->cmd]);
-	dev_err(&i2c->adap.dev, "receive data count:%d  %d\n",
-		i2c->cmd, i2c->data_buf[i2c->cmd]);
-
-	for (i = 0; i < 16; i++) {
-		if (src & BIT(i))
-			dev_dbg(&i2c->adap.dev, "I2C TXABRT[%d]=%s\n",
-				i, jz4780_i2c_abrt_src[i]);
-	}
+	dev_dbg(&i2c->adap.dev, "txabrt: 0x%08x, cmd: %d, send: %d, recv: %d\n",
+		src, i2c->cmd, i2c->cmd_buf[i2c->cmd], i2c->data_buf[i2c->cmd]);
 }
 
 static inline int jz4780_i2c_xfer_read(struct jz4780_i2c *i2c,
@@ -598,7 +565,7 @@ static inline int jz4780_i2c_xfer_read(struct jz4780_i2c *i2c,
 				       int idx)
 {
 	int ret = 0;
-	long timeout;
+	unsigned long time_left;
 	int wait_time = JZ4780_I2C_TIMEOUT * (len + 5);
 	unsigned short tmp;
 	unsigned long flags;
@@ -633,10 +600,10 @@ static inline int jz4780_i2c_xfer_read(struct jz4780_i2c *i2c,
 
 	spin_unlock_irqrestore(&i2c->lock, flags);
 
-	timeout = wait_for_completion_timeout(&i2c->trans_waitq,
-					      msecs_to_jiffies(wait_time));
+	time_left = wait_for_completion_timeout(&i2c->trans_waitq,
+						msecs_to_jiffies(wait_time));
 
-	if (!timeout) {
+	if (!time_left) {
 		dev_err(&i2c->adap.dev, "irq read timeout\n");
 		dev_dbg(&i2c->adap.dev, "send cmd count:%d  %d\n",
 			i2c->cmd, i2c->cmd_buf[i2c->cmd]);
@@ -660,7 +627,7 @@ static inline int jz4780_i2c_xfer_write(struct jz4780_i2c *i2c,
 {
 	int ret = 0;
 	int wait_time = JZ4780_I2C_TIMEOUT * (len + 5);
-	long timeout;
+	unsigned long time_left;
 	unsigned short tmp;
 	unsigned long flags;
 
@@ -688,14 +655,14 @@ static inline int jz4780_i2c_xfer_write(struct jz4780_i2c *i2c,
 
 	spin_unlock_irqrestore(&i2c->lock, flags);
 
-	timeout = wait_for_completion_timeout(&i2c->trans_waitq,
-					      msecs_to_jiffies(wait_time));
-	if (timeout && !i2c->stop_hold) {
+	time_left = wait_for_completion_timeout(&i2c->trans_waitq,
+						msecs_to_jiffies(wait_time));
+	if (time_left && !i2c->stop_hold) {
 		unsigned short i2c_sta;
 		int write_in_process;
 
-		timeout = JZ4780_I2C_TIMEOUT * 100;
-		for (; timeout > 0; timeout--) {
+		time_left = JZ4780_I2C_TIMEOUT * 100;
+		for (; time_left > 0; time_left--) {
 			i2c_sta = jz4780_i2c_readw(i2c, JZ4780_I2C_STA);
 
 			write_in_process = (i2c_sta & JZ4780_I2C_STA_MSTACT) ||
@@ -706,7 +673,7 @@ static inline int jz4780_i2c_xfer_write(struct jz4780_i2c *i2c,
 		}
 	}
 
-	if (!timeout) {
+	if (!time_left) {
 		dev_err(&i2c->adap.dev, "write wait timeout\n");
 		ret = -EIO;
 	}
@@ -784,6 +751,7 @@ static const struct ingenic_i2c_config x1000_i2c_config = {
 };
 
 static const struct of_device_id jz4780_i2c_of_matches[] = {
+	{ .compatible = "ingenic,jz4770-i2c", .data = &jz4780_i2c_config },
 	{ .compatible = "ingenic,jz4780-i2c", .data = &jz4780_i2c_config },
 	{ .compatible = "ingenic,x1000-i2c", .data = &x1000_i2c_config },
 	{ /* sentinel */ }
@@ -795,7 +763,6 @@ static int jz4780_i2c_probe(struct platform_device *pdev)
 	int ret = 0;
 	unsigned int clk_freq = 0;
 	unsigned short tmp;
-	struct resource *r;
 	struct jz4780_i2c *i2c;
 
 	i2c = devm_kzalloc(&pdev->dev, sizeof(struct jz4780_i2c), GFP_KERNEL);
@@ -819,8 +786,7 @@ static int jz4780_i2c_probe(struct platform_device *pdev)
 	init_completion(&i2c->trans_waitq);
 	spin_lock_init(&i2c->lock);
 
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	i2c->iomem = devm_ioremap_resource(&pdev->dev, r);
+	i2c->iomem = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(i2c->iomem))
 		return PTR_ERR(i2c->iomem);
 
@@ -859,7 +825,10 @@ static int jz4780_i2c_probe(struct platform_device *pdev)
 
 	jz4780_i2c_writew(i2c, JZ4780_I2C_INTM, 0x0);
 
-	i2c->irq = platform_get_irq(pdev, 0);
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		goto err;
+	i2c->irq = ret;
 	ret = devm_request_irq(&pdev->dev, i2c->irq, jz4780_i2c_irq, 0,
 			       dev_name(&pdev->dev), i2c);
 	if (ret)
@@ -876,21 +845,20 @@ err:
 	return ret;
 }
 
-static int jz4780_i2c_remove(struct platform_device *pdev)
+static void jz4780_i2c_remove(struct platform_device *pdev)
 {
 	struct jz4780_i2c *i2c = platform_get_drvdata(pdev);
 
 	clk_disable_unprepare(i2c->clk);
 	i2c_del_adapter(&i2c->adap);
-	return 0;
 }
 
 static struct platform_driver jz4780_i2c_driver = {
 	.probe		= jz4780_i2c_probe,
-	.remove		= jz4780_i2c_remove,
+	.remove_new	= jz4780_i2c_remove,
 	.driver		= {
 		.name	= "jz4780-i2c",
-		.of_match_table = of_match_ptr(jz4780_i2c_of_matches),
+		.of_match_table = jz4780_i2c_of_matches,
 	},
 };
 

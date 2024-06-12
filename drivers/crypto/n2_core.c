@@ -9,13 +9,15 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
+#include <linux/of_address.h>
+#include <linux/platform_device.h>
 #include <linux/cpumask.h>
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/crypto.h>
 #include <crypto/md5.h>
-#include <crypto/sha.h>
+#include <crypto/sha1.h>
+#include <crypto/sha2.h>
 #include <crypto/aes.h>
 #include <crypto/internal/des.h>
 #include <linux/mutex.h>
@@ -39,7 +41,7 @@
 static const char version[] =
 	DRV_MODULE_NAME ".c:v" DRV_MODULE_VERSION " (" DRV_MODULE_RELDATE ")\n";
 
-MODULE_AUTHOR("David S. Miller (davem@davemloft.net)");
+MODULE_AUTHOR("David S. Miller <davem@davemloft.net>");
 MODULE_DESCRIPTION("Niagara2 Crypto driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_MODULE_VERSION);
@@ -249,7 +251,7 @@ static inline bool n2_should_run_async(struct spu_queue *qp, int this_len)
 struct n2_ahash_alg {
 	struct list_head	entry;
 	const u8		*hash_zero;
-	const u32		*hash_init;
+	const u8		*hash_init;
 	u8			hw_op_hashsz;
 	u8			digest_size;
 	u8			auth_type;
@@ -462,7 +464,6 @@ static int n2_hmac_async_setkey(struct crypto_ahash *tfm, const u8 *key,
 	struct n2_hmac_ctx *ctx = crypto_ahash_ctx(tfm);
 	struct crypto_shash *child_shash = ctx->child_shash;
 	struct crypto_ahash *fallback_tfm;
-	SHASH_DESC_ON_STACK(shash, child_shash);
 	int err, bs, ds;
 
 	fallback_tfm = ctx->base.fallback_tfm;
@@ -470,14 +471,12 @@ static int n2_hmac_async_setkey(struct crypto_ahash *tfm, const u8 *key,
 	if (err)
 		return err;
 
-	shash->tfm = child_shash;
-
 	bs = crypto_shash_blocksize(child_shash);
 	ds = crypto_shash_digestsize(child_shash);
 	BUG_ON(ds > N2_HASH_KEY_MAX);
 	if (keylen > bs) {
-		err = crypto_shash_digest(shash, key, keylen,
-					  ctx->hash_key);
+		err = crypto_shash_tfm_digest(child_shash, key, keylen,
+					      ctx->hash_key);
 		if (err)
 			return err;
 		keylen = ds;
@@ -665,7 +664,6 @@ struct n2_skcipher_context {
 		u8		aes[AES_MAX_KEY_SIZE];
 		u8		des[DES_KEY_SIZE];
 		u8		des3[3 * DES_KEY_SIZE];
-		u8		arc4[258]; /* S-box, X, Y */
 	} key;
 };
 
@@ -789,36 +787,6 @@ static int n2_3des_setkey(struct crypto_skcipher *skcipher, const u8 *key,
 
 	ctx->key_len = keylen;
 	memcpy(ctx->key.des3, key, keylen);
-	return 0;
-}
-
-static int n2_arc4_setkey(struct crypto_skcipher *skcipher, const u8 *key,
-			  unsigned int keylen)
-{
-	struct crypto_tfm *tfm = crypto_skcipher_tfm(skcipher);
-	struct n2_skcipher_context *ctx = crypto_tfm_ctx(tfm);
-	struct n2_skcipher_alg *n2alg = n2_skcipher_alg(skcipher);
-	u8 *s = ctx->key.arc4;
-	u8 *x = s + 256;
-	u8 *y = x + 1;
-	int i, j, k;
-
-	ctx->enc_type = n2alg->enc_type;
-
-	j = k = 0;
-	*x = 0;
-	*y = 0;
-	for (i = 0; i < 256; i++)
-		s[i] = i;
-	for (i = 0; i < 256; i++) {
-		u8 a = s[i];
-		j = (j + key[k] + a) & 0xff;
-		s[i] = s[j];
-		s[j] = a;
-		if (++k >= keylen)
-			k = 0;
-	}
-
 	return 0;
 }
 
@@ -1125,21 +1093,6 @@ struct n2_skcipher_tmpl {
 };
 
 static const struct n2_skcipher_tmpl skcipher_tmpls[] = {
-	/* ARC4: only ECB is supported (chaining bits ignored) */
-	{	.name		= "ecb(arc4)",
-		.drv_name	= "ecb-arc4",
-		.block_size	= 1,
-		.enc_type	= (ENC_TYPE_ALG_RC4_STREAM |
-				   ENC_TYPE_CHAINING_ECB),
-		.skcipher	= {
-			.min_keysize	= 1,
-			.max_keysize	= 256,
-			.setkey		= n2_arc4_setkey,
-			.encrypt	= n2_encrypt_ecb,
-			.decrypt	= n2_decrypt_ecb,
-		},
-	},
-
 	/* DES: ECB CBC and CFB are supported */
 	{	.name		= "ecb(des)",
 		.drv_name	= "ecb-des",
@@ -1161,19 +1114,6 @@ static const struct n2_skcipher_tmpl skcipher_tmpls[] = {
 				   ENC_TYPE_CHAINING_CBC),
 		.skcipher	= {
 			.ivsize		= DES_BLOCK_SIZE,
-			.min_keysize	= DES_KEY_SIZE,
-			.max_keysize	= DES_KEY_SIZE,
-			.setkey		= n2_des_setkey,
-			.encrypt	= n2_encrypt_chaining,
-			.decrypt	= n2_decrypt_chaining,
-		},
-	},
-	{	.name		= "cfb(des)",
-		.drv_name	= "cfb-des",
-		.block_size	= DES_BLOCK_SIZE,
-		.enc_type	= (ENC_TYPE_ALG_DES |
-				   ENC_TYPE_CHAINING_CFB),
-		.skcipher	= {
 			.min_keysize	= DES_KEY_SIZE,
 			.max_keysize	= DES_KEY_SIZE,
 			.setkey		= n2_des_setkey,
@@ -1210,19 +1150,7 @@ static const struct n2_skcipher_tmpl skcipher_tmpls[] = {
 			.decrypt	= n2_decrypt_chaining,
 		},
 	},
-	{	.name		= "cfb(des3_ede)",
-		.drv_name	= "cfb-3des",
-		.block_size	= DES_BLOCK_SIZE,
-		.enc_type	= (ENC_TYPE_ALG_3DES |
-				   ENC_TYPE_CHAINING_CFB),
-		.skcipher	= {
-			.min_keysize	= 3 * DES_KEY_SIZE,
-			.max_keysize	= 3 * DES_KEY_SIZE,
-			.setkey		= n2_3des_setkey,
-			.encrypt	= n2_encrypt_chaining,
-			.decrypt	= n2_decrypt_chaining,
-		},
-	},
+
 	/* AES: ECB CBC and CTR are supported */
 	{	.name		= "ecb(aes)",
 		.drv_name	= "ecb-aes",
@@ -1274,15 +1202,16 @@ static LIST_HEAD(skcipher_algs);
 struct n2_hash_tmpl {
 	const char	*name;
 	const u8	*hash_zero;
-	const u32	*hash_init;
+	const u8	*hash_init;
 	u8		hw_op_hashsz;
 	u8		digest_size;
+	u8		statesize;
 	u8		block_size;
 	u8		auth_type;
 	u8		hmac_type;
 };
 
-static const u32 n2_md5_init[MD5_HASH_WORDS] = {
+static const __le32 n2_md5_init[MD5_HASH_WORDS] = {
 	cpu_to_le32(MD5_H0),
 	cpu_to_le32(MD5_H1),
 	cpu_to_le32(MD5_H2),
@@ -1303,35 +1232,39 @@ static const u32 n2_sha224_init[SHA256_DIGEST_SIZE / 4] = {
 static const struct n2_hash_tmpl hash_tmpls[] = {
 	{ .name		= "md5",
 	  .hash_zero	= md5_zero_message_hash,
-	  .hash_init	= n2_md5_init,
+	  .hash_init	= (u8 *)n2_md5_init,
 	  .auth_type	= AUTH_TYPE_MD5,
 	  .hmac_type	= AUTH_TYPE_HMAC_MD5,
 	  .hw_op_hashsz	= MD5_DIGEST_SIZE,
 	  .digest_size	= MD5_DIGEST_SIZE,
+	  .statesize	= sizeof(struct md5_state),
 	  .block_size	= MD5_HMAC_BLOCK_SIZE },
 	{ .name		= "sha1",
 	  .hash_zero	= sha1_zero_message_hash,
-	  .hash_init	= n2_sha1_init,
+	  .hash_init	= (u8 *)n2_sha1_init,
 	  .auth_type	= AUTH_TYPE_SHA1,
 	  .hmac_type	= AUTH_TYPE_HMAC_SHA1,
 	  .hw_op_hashsz	= SHA1_DIGEST_SIZE,
 	  .digest_size	= SHA1_DIGEST_SIZE,
+	  .statesize	= sizeof(struct sha1_state),
 	  .block_size	= SHA1_BLOCK_SIZE },
 	{ .name		= "sha256",
 	  .hash_zero	= sha256_zero_message_hash,
-	  .hash_init	= n2_sha256_init,
+	  .hash_init	= (u8 *)n2_sha256_init,
 	  .auth_type	= AUTH_TYPE_SHA256,
 	  .hmac_type	= AUTH_TYPE_HMAC_SHA256,
 	  .hw_op_hashsz	= SHA256_DIGEST_SIZE,
 	  .digest_size	= SHA256_DIGEST_SIZE,
+	  .statesize	= sizeof(struct sha256_state),
 	  .block_size	= SHA256_BLOCK_SIZE },
 	{ .name		= "sha224",
 	  .hash_zero	= sha224_zero_message_hash,
-	  .hash_init	= n2_sha224_init,
+	  .hash_init	= (u8 *)n2_sha224_init,
 	  .auth_type	= AUTH_TYPE_SHA256,
 	  .hmac_type	= AUTH_TYPE_RESERVED,
 	  .hw_op_hashsz	= SHA256_DIGEST_SIZE,
 	  .digest_size	= SHA224_DIGEST_SIZE,
+	  .statesize	= sizeof(struct sha256_state),
 	  .block_size	= SHA224_BLOCK_SIZE },
 };
 #define NUM_HASH_TMPLS ARRAY_SIZE(hash_tmpls)
@@ -1385,7 +1318,8 @@ static int __n2_register_one_skcipher(const struct n2_skcipher_tmpl *tmpl)
 	snprintf(alg->base.cra_name, CRYPTO_MAX_ALG_NAME, "%s", tmpl->name);
 	snprintf(alg->base.cra_driver_name, CRYPTO_MAX_ALG_NAME, "%s-n2", tmpl->drv_name);
 	alg->base.cra_priority = N2_CRA_PRIORITY;
-	alg->base.cra_flags = CRYPTO_ALG_KERN_DRIVER_ONLY | CRYPTO_ALG_ASYNC;
+	alg->base.cra_flags = CRYPTO_ALG_KERN_DRIVER_ONLY | CRYPTO_ALG_ASYNC |
+			      CRYPTO_ALG_ALLOCATES_MEMORY;
 	alg->base.cra_blocksize = tmpl->block_size;
 	p->enc_type = tmpl->enc_type;
 	alg->base.cra_ctxsize = sizeof(struct n2_skcipher_context);
@@ -1423,8 +1357,12 @@ static int __n2_register_one_hmac(struct n2_ahash_alg *n2ahash)
 	ahash->setkey = n2_hmac_async_setkey;
 
 	base = &ahash->halg.base;
-	snprintf(base->cra_name, CRYPTO_MAX_ALG_NAME, "hmac(%s)", p->child_alg);
-	snprintf(base->cra_driver_name, CRYPTO_MAX_ALG_NAME, "hmac-%s-n2", p->child_alg);
+	if (snprintf(base->cra_name, CRYPTO_MAX_ALG_NAME, "hmac(%s)",
+		     p->child_alg) >= CRYPTO_MAX_ALG_NAME)
+		goto out_free_p;
+	if (snprintf(base->cra_driver_name, CRYPTO_MAX_ALG_NAME, "hmac-%s-n2",
+		     p->child_alg) >= CRYPTO_MAX_ALG_NAME)
+		goto out_free_p;
 
 	base->cra_ctxsize = sizeof(struct n2_hmac_ctx);
 	base->cra_init = n2_hmac_cra_init;
@@ -1435,6 +1373,7 @@ static int __n2_register_one_hmac(struct n2_ahash_alg *n2ahash)
 	if (err) {
 		pr_err("%s alg registration failed\n", base->cra_name);
 		list_del(&p->derived.entry);
+out_free_p:
 		kfree(p);
 	} else {
 		pr_info("%s alg registered\n", base->cra_name);
@@ -1471,6 +1410,7 @@ static int __n2_register_one_ahash(const struct n2_hash_tmpl *tmpl)
 
 	halg = &ahash->halg;
 	halg->digestsize = tmpl->digest_size;
+	halg->statesize = tmpl->statesize;
 
 	base = &halg->base;
 	snprintf(base->cra_name, CRYPTO_MAX_ALG_NAME, "%s", tmpl->name);
@@ -1541,7 +1481,7 @@ static void n2_unregister_algs(void)
  *
  * So we have to back-translate, going through the 'intr' and 'ino'
  * property tables of the n2cp MDESC node, matching it with the OF
- * 'interrupts' property entries, in order to to figure out which
+ * 'interrupts' property entries, in order to figure out which
  * devino goes to which already-translated IRQ.
  */
 static int find_devino_index(struct platform_device *dev, struct spu_mdesc_info *ip,
@@ -1836,11 +1776,9 @@ static int grab_mdesc_irq_props(struct mdesc_handle *mdesc,
 				struct spu_mdesc_info *ip,
 				const char *node_name)
 {
-	const unsigned int *reg;
-	u64 node;
+	u64 node, reg;
 
-	reg = of_get_property(dev->dev.of_node, "reg", NULL);
-	if (!reg)
+	if (of_property_read_reg(dev->dev.of_node, 0, &reg, NULL) < 0)
 		return -ENODEV;
 
 	mdesc_for_each_node_by_name(mdesc, node, "virtual-device") {
@@ -1851,7 +1789,7 @@ static int grab_mdesc_irq_props(struct mdesc_handle *mdesc,
 		if (!name || strcmp(name, node_name))
 			continue;
 		chdl = mdesc_get_property(mdesc, node, "cfg-handle", NULL);
-		if (!chdl || (*chdl != *reg))
+		if (!chdl || (*chdl != reg))
 			continue;
 		ip->cfg_handle = *chdl;
 		return get_irq_props(mdesc, node, ip);
@@ -2053,7 +1991,7 @@ out_free_n2cp:
 	return err;
 }
 
-static int n2_crypto_remove(struct platform_device *dev)
+static void n2_crypto_remove(struct platform_device *dev)
 {
 	struct n2_crypto *np = dev_get_drvdata(&dev->dev);
 
@@ -2064,8 +2002,6 @@ static int n2_crypto_remove(struct platform_device *dev)
 	release_global_resources();
 
 	free_n2cp(np);
-
-	return 0;
 }
 
 static struct n2_mau *alloc_ncp(void)
@@ -2151,7 +2087,7 @@ out_free_ncp:
 	return err;
 }
 
-static int n2_mau_remove(struct platform_device *dev)
+static void n2_mau_remove(struct platform_device *dev)
 {
 	struct n2_mau *mp = dev_get_drvdata(&dev->dev);
 
@@ -2160,8 +2096,6 @@ static int n2_mau_remove(struct platform_device *dev)
 	release_global_resources();
 
 	free_ncp(mp);
-
-	return 0;
 }
 
 static const struct of_device_id n2_crypto_match[] = {
@@ -2188,7 +2122,7 @@ static struct platform_driver n2_crypto_driver = {
 		.of_match_table	=	n2_crypto_match,
 	},
 	.probe		=	n2_crypto_probe,
-	.remove		=	n2_crypto_remove,
+	.remove_new	=	n2_crypto_remove,
 };
 
 static const struct of_device_id n2_mau_match[] = {
@@ -2215,7 +2149,7 @@ static struct platform_driver n2_mau_driver = {
 		.of_match_table	=	n2_mau_match,
 	},
 	.probe		=	n2_mau_probe,
-	.remove		=	n2_mau_remove,
+	.remove_new	=	n2_mau_remove,
 };
 
 static struct platform_driver * const drivers[] = {

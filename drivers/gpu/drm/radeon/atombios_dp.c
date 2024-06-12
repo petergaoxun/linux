@@ -30,7 +30,7 @@
 
 #include "atom.h"
 #include "atom-bits.h"
-#include <drm/drm_dp_helper.h>
+#include <drm/display/drm_dp_helper.h>
 
 /* move these to drm_dp_helper.c/h */
 #define DP_LINK_CONFIGURATION_SIZE 9
@@ -112,7 +112,7 @@ static int radeon_process_aux_ch(struct radeon_i2c_chan *chan,
 	if (ASIC_IS_DCE4(rdev))
 		args.v2.ucHPD_ID = chan->rec.hpd;
 
-	atom_execute_table_scratch_unlocked(rdev->mode_info.atom_context, index, (uint32_t *)&args);
+	atom_execute_table_scratch_unlocked(rdev->mode_info.atom_context, index, (uint32_t *)&args, sizeof(args));
 
 	*ack = args.v1.ucReplyStatus;
 
@@ -232,6 +232,7 @@ void radeon_dp_aux_init(struct radeon_connector *radeon_connector)
 
 	radeon_connector->ddc_bus->rec.hpd = radeon_connector->hpd.hpd;
 	radeon_connector->ddc_bus->aux.dev = radeon_connector->base.kdev;
+	radeon_connector->ddc_bus->aux.drm_dev = radeon_connector->base.dev;
 	if (ASIC_IS_DCE5(rdev)) {
 		if (radeon_auxch)
 			radeon_connector->ddc_bus->aux.transfer = radeon_dp_aux_transfer_native;
@@ -353,7 +354,7 @@ static u8 radeon_dp_encoder_service(struct radeon_device *rdev,
 	args.ucLaneNum = lane_num;
 	args.ucStatus = 0;
 
-	atom_execute_table(rdev->mode_info.atom_context, index, (uint32_t *)&args);
+	atom_execute_table(rdev->mode_info.atom_context, index, (uint32_t *)&args, sizeof(args));
 	return args.ucStatus;
 }
 
@@ -679,7 +680,7 @@ static int radeon_dp_link_train_cr(struct radeon_dp_link_train_info *dp_info)
 	dp_info->tries = 0;
 	voltage = 0xff;
 	while (1) {
-		drm_dp_link_train_clock_recovery_delay(dp_info->dpcd);
+		drm_dp_link_train_clock_recovery_delay(dp_info->aux, dp_info->dpcd);
 
 		if (drm_dp_dpcd_read_link_status(dp_info->aux,
 						 dp_info->link_status) <= 0) {
@@ -742,7 +743,7 @@ static int radeon_dp_link_train_ce(struct radeon_dp_link_train_info *dp_info)
 	dp_info->tries = 0;
 	channel_eq = false;
 	while (1) {
-		drm_dp_link_train_channel_eq_delay(dp_info->dpcd);
+		drm_dp_link_train_channel_eq_delay(dp_info->aux, dp_info->dpcd);
 
 		if (drm_dp_dpcd_read_link_status(dp_info->aux,
 						 dp_info->link_status) <= 0) {

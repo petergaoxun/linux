@@ -10,16 +10,16 @@ MOD_LIVEPATCH3=test_klp_state3
 
 setup_config
 
-# TEST: Loading and removing a module that modifies the system state
 
-echo -n "TEST: system state modification ... "
-dmesg -C
+# Load and remove a module that modifies the system state
+
+start_test "system state modification"
 
 load_lp $MOD_LIVEPATCH
 disable_lp $MOD_LIVEPATCH
 unload_lp $MOD_LIVEPATCH
 
-check_result "% modprobe $MOD_LIVEPATCH
+check_result "% insmod test_modules/$MOD_LIVEPATCH.ko
 livepatch: enabling patch '$MOD_LIVEPATCH'
 livepatch: '$MOD_LIVEPATCH': initializing patching transition
 $MOD_LIVEPATCH: pre_patch_callback: vmlinux
@@ -41,10 +41,9 @@ livepatch: '$MOD_LIVEPATCH': unpatching complete
 % rmmod $MOD_LIVEPATCH"
 
 
-# TEST: Take over system state change by a cumulative patch
+# Take over system state change by a cumulative patch
 
-echo -n "TEST: taking over system state modification ... "
-dmesg -C
+start_test "taking over system state modification"
 
 load_lp $MOD_LIVEPATCH
 load_lp $MOD_LIVEPATCH2
@@ -52,7 +51,7 @@ unload_lp $MOD_LIVEPATCH
 disable_lp $MOD_LIVEPATCH2
 unload_lp $MOD_LIVEPATCH2
 
-check_result "% modprobe $MOD_LIVEPATCH
+check_result "% insmod test_modules/$MOD_LIVEPATCH.ko
 livepatch: enabling patch '$MOD_LIVEPATCH'
 livepatch: '$MOD_LIVEPATCH': initializing patching transition
 $MOD_LIVEPATCH: pre_patch_callback: vmlinux
@@ -62,7 +61,7 @@ livepatch: '$MOD_LIVEPATCH': completing patching transition
 $MOD_LIVEPATCH: post_patch_callback: vmlinux
 $MOD_LIVEPATCH: fix_console_loglevel: fixing console_loglevel
 livepatch: '$MOD_LIVEPATCH': patching complete
-% modprobe $MOD_LIVEPATCH2
+% insmod test_modules/$MOD_LIVEPATCH2.ko
 livepatch: enabling patch '$MOD_LIVEPATCH2'
 livepatch: '$MOD_LIVEPATCH2': initializing patching transition
 $MOD_LIVEPATCH2: pre_patch_callback: vmlinux
@@ -85,10 +84,9 @@ livepatch: '$MOD_LIVEPATCH2': unpatching complete
 % rmmod $MOD_LIVEPATCH2"
 
 
-# TEST: Take over system state change by a cumulative patch
+# Take over system state change by a cumulative patch
 
-echo -n "TEST: compatible cumulative livepatches ... "
-dmesg -C
+start_test "compatible cumulative livepatches"
 
 load_lp $MOD_LIVEPATCH2
 load_lp $MOD_LIVEPATCH3
@@ -98,7 +96,7 @@ disable_lp $MOD_LIVEPATCH2
 unload_lp $MOD_LIVEPATCH2
 unload_lp $MOD_LIVEPATCH3
 
-check_result "% modprobe $MOD_LIVEPATCH2
+check_result "% insmod test_modules/$MOD_LIVEPATCH2.ko
 livepatch: enabling patch '$MOD_LIVEPATCH2'
 livepatch: '$MOD_LIVEPATCH2': initializing patching transition
 $MOD_LIVEPATCH2: pre_patch_callback: vmlinux
@@ -108,7 +106,7 @@ livepatch: '$MOD_LIVEPATCH2': completing patching transition
 $MOD_LIVEPATCH2: post_patch_callback: vmlinux
 $MOD_LIVEPATCH2: fix_console_loglevel: fixing console_loglevel
 livepatch: '$MOD_LIVEPATCH2': patching complete
-% modprobe $MOD_LIVEPATCH3
+% insmod test_modules/$MOD_LIVEPATCH3.ko
 livepatch: enabling patch '$MOD_LIVEPATCH3'
 livepatch: '$MOD_LIVEPATCH3': initializing patching transition
 $MOD_LIVEPATCH3: pre_patch_callback: vmlinux
@@ -119,7 +117,7 @@ $MOD_LIVEPATCH3: post_patch_callback: vmlinux
 $MOD_LIVEPATCH3: fix_console_loglevel: taking over the console_loglevel change
 livepatch: '$MOD_LIVEPATCH3': patching complete
 % rmmod $MOD_LIVEPATCH2
-% modprobe $MOD_LIVEPATCH2
+% insmod test_modules/$MOD_LIVEPATCH2.ko
 livepatch: enabling patch '$MOD_LIVEPATCH2'
 livepatch: '$MOD_LIVEPATCH2': initializing patching transition
 $MOD_LIVEPATCH2: pre_patch_callback: vmlinux
@@ -142,17 +140,16 @@ livepatch: '$MOD_LIVEPATCH2': unpatching complete
 % rmmod $MOD_LIVEPATCH3"
 
 
-# TEST: Failure caused by incompatible cumulative livepatches
+# Failure caused by incompatible cumulative livepatches
 
-echo -n "TEST: incompatible cumulative livepatches ... "
-dmesg -C
+start_test "incompatible cumulative livepatches"
 
 load_lp $MOD_LIVEPATCH2
 load_failing_mod $MOD_LIVEPATCH
 disable_lp $MOD_LIVEPATCH2
 unload_lp $MOD_LIVEPATCH2
 
-check_result "% modprobe $MOD_LIVEPATCH2
+check_result "% insmod test_modules/$MOD_LIVEPATCH2.ko
 livepatch: enabling patch '$MOD_LIVEPATCH2'
 livepatch: '$MOD_LIVEPATCH2': initializing patching transition
 $MOD_LIVEPATCH2: pre_patch_callback: vmlinux
@@ -162,9 +159,9 @@ livepatch: '$MOD_LIVEPATCH2': completing patching transition
 $MOD_LIVEPATCH2: post_patch_callback: vmlinux
 $MOD_LIVEPATCH2: fix_console_loglevel: fixing console_loglevel
 livepatch: '$MOD_LIVEPATCH2': patching complete
-% modprobe $MOD_LIVEPATCH
+% insmod test_modules/$MOD_LIVEPATCH.ko
 livepatch: Livepatch patch ($MOD_LIVEPATCH) is not compatible with the already installed livepatches.
-modprobe: ERROR: could not insert '$MOD_LIVEPATCH': Invalid argument
+insmod: ERROR: could not insert module test_modules/$MOD_LIVEPATCH.ko: Invalid parameters
 % echo 0 > /sys/kernel/livepatch/$MOD_LIVEPATCH2/enabled
 livepatch: '$MOD_LIVEPATCH2': initializing unpatching transition
 $MOD_LIVEPATCH2: pre_unpatch_callback: vmlinux

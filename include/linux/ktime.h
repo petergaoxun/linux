@@ -21,11 +21,10 @@
 #ifndef _LINUX_KTIME_H
 #define _LINUX_KTIME_H
 
-#include <linux/time.h>
+#include <asm/bug.h>
 #include <linux/jiffies.h>
-
-/* Nanosecond scalar representation for kernel time values */
-typedef s64	ktime_t;
+#include <linux/time.h>
+#include <linux/types.h>
 
 /**
  * ktime_set - Set a ktime_t variable from a seconds/nanoseconds value
@@ -216,14 +215,7 @@ static inline __must_check bool ktime_to_timespec64_cond(const ktime_t kt,
 	}
 }
 
-/*
- * The resolution of the clocks. The resolution value is returned in
- * the clock_getres() system call to give application programmers an
- * idea of the (in)accuracy of timers. Timer values are rounded up to
- * this resolution values.
- */
-#define LOW_RES_NSEC		TICK_NSEC
-#define KTIME_LOW_RES		(LOW_RES_NSEC)
+#include <vdso/ktime.h>
 
 static inline ktime_t ns_to_ktime(u64 ns)
 {
@@ -236,6 +228,5 @@ static inline ktime_t ms_to_ktime(u64 ms)
 }
 
 # include <linux/timekeeping.h>
-# include <linux/timekeeping32.h>
 
 #endif

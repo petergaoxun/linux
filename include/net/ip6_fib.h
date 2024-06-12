@@ -19,6 +19,8 @@
 #include <net/netlink.h>
 #include <net/inetpeer.h>
 #include <net/fib_notifier.h>
+#include <linux/indirect_call_wrapper.h>
+#include <uapi/linux/bpf.h>
 
 #ifdef CONFIG_IPV6_MULTIPLE_TABLES
 #define FIB6_TABLE_HASHSZ 256
@@ -27,12 +29,6 @@
 #endif
 
 #define RT6_DEBUG 2
-
-#if RT6_DEBUG >= 3
-#define RT6_TRACE(x...) pr_debug(x)
-#else
-#define RT6_TRACE(x...) do { ; } while (0)
-#endif
 
 struct rt6_info;
 struct fib6_info;
@@ -65,6 +61,7 @@ struct fib6_config {
 	struct nl_info	fc_nlinfo;
 	struct nlattr	*fc_encap;
 	u16		fc_encap_type;
+	bool		fc_is_fdb;
 };
 
 struct fib6_node {
@@ -164,7 +161,7 @@ struct fib6_info {
 	struct fib6_node __rcu		*fib6_node;
 
 	/* Multipath routes:
-	 * siblings is a list of fib6_info that have the the same metric/weight,
+	 * siblings is a list of fib6_info that have the same metric/weight,
 	 * destination, but not the same gateway. nsiblings is just a cache
 	 * to speed up lookup.
 	 */
@@ -176,6 +173,9 @@ struct fib6_info {
 
 	refcount_t			fib6_ref;
 	unsigned long			expires;
+
+	struct hlist_node		gc_link;
+
 	struct dst_metrics		*fib6_metrics;
 #define fib6_pmtu		fib6_metrics->metrics[RTAX_MTU-1]
 
@@ -187,32 +187,32 @@ struct fib6_info {
 	u32				fib6_metric;
 	u8				fib6_protocol;
 	u8				fib6_type;
+
+	u8				offload;
+	u8				trap;
+	u8				offload_failed;
+
 	u8				should_flush:1,
 					dst_nocount:1,
 					dst_nopolicy:1,
-					dst_host:1,
 					fib6_destroying:1,
-					offload:1,
-					trap:1,
-					unused:1;
+					unused:4;
 
 	struct rcu_head			rcu;
 	struct nexthop			*nh;
-	struct fib6_nh			fib6_nh[0];
+	struct fib6_nh			fib6_nh[];
 };
 
 struct rt6_info {
 	struct dst_entry		dst;
 	struct fib6_info __rcu		*from;
+	int				sernum;
 
 	struct rt6key			rt6i_dst;
 	struct rt6key			rt6i_src;
 	struct in6_addr			rt6i_gateway;
 	struct inet6_dev		*rt6i_idev;
 	u32				rt6i_flags;
-
-	struct list_head		rt6i_uncached;
-	struct uncached_list		*rt6i_uncached_list;
 
 	/* more non-fragment space at head required */
 	unsigned short			rt6i_nfheader_len;
@@ -234,9 +234,11 @@ struct fib6_result {
 	for (rt = (w)->leaf; rt;					\
 	     rt = rcu_dereference_protected(rt->fib6_next, 1))
 
-static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)
+#define dst_rt6_info(_ptr) container_of_const(_ptr, struct rt6_info, dst)
+
+static inline struct inet6_dev *ip6_dst_idev(const struct dst_entry *dst)
 {
-	return ((struct rt6_info *)dst)->rt6i_idev;
+	return dst_rt6_info(dst)->rt6i_idev;
 }
 
 static inline bool fib6_requires_src(const struct fib6_info *rt)
@@ -244,12 +246,18 @@ static inline bool fib6_requires_src(const struct fib6_info *rt)
 	return rt->fib6_src.plen > 0;
 }
 
+/* The callers should hold f6i->fib6_table->tb6_lock if a route has ever
+ * been added to a table before.
+ */
 static inline void fib6_clean_expires(struct fib6_info *f6i)
 {
 	f6i->fib6_flags &= ~RTF_EXPIRES;
 	f6i->expires = 0;
 }
 
+/* The callers should hold f6i->fib6_table->tb6_lock if a route has ever
+ * been added to a table before.
+ */
 static inline void fib6_set_expires(struct fib6_info *f6i,
 				    unsigned long expires)
 {
@@ -264,7 +272,7 @@ static inline bool fib6_check_expired(const struct fib6_info *f6i)
 	return false;
 }
 
-/* Function to safely get fn->sernum for passed in rt
+/* Function to safely get fn->fn_sernum for passed in rt
  * and store result in passed in cookie.
  * Return true if we can get cookie safely
  * Return false if not
@@ -278,8 +286,8 @@ static inline bool fib6_get_cookie_safe(const struct fib6_info *f6i,
 	fn = rcu_dereference(f6i->fib6_node);
 
 	if (fn) {
-		*cookie = fn->fn_sernum;
-		/* pairs with smp_wmb() in fib6_update_sernum_upto_root() */
+		*cookie = READ_ONCE(fn->fn_sernum);
+		/* pairs with smp_wmb() in __fib6_update_sernum_upto_root() */
 		smp_rmb();
 		status = true;
 	}
@@ -291,6 +299,9 @@ static inline u32 rt6_get_cookie(const struct rt6_info *rt)
 {
 	struct fib6_info *from;
 	u32 cookie = 0;
+
+	if (rt->sernum)
+		return rt->sernum;
 
 	rcu_read_lock();
 
@@ -327,15 +338,10 @@ static inline bool fib6_info_hold_safe(struct fib6_info *f6i)
 
 static inline void fib6_info_release(struct fib6_info *f6i)
 {
-	if (f6i && refcount_dec_and_test(&f6i->fib6_ref))
-		call_rcu(&f6i->rcu, fib6_info_destroy_rcu);
-}
-
-static inline void fib6_info_hw_flags_set(struct fib6_info *f6i, bool offload,
-					  bool trap)
-{
-	f6i->offload = offload;
-	f6i->trap = trap;
+	if (f6i && refcount_dec_and_test(&f6i->fib6_ref)) {
+		DEBUG_NET_WARN_ON_ONCE(!hlist_unhashed(&f6i->gc_link));
+		call_rcu_hurry(&f6i->rcu, fib6_info_destroy_rcu);
+	}
 }
 
 enum fib6_walk_state {
@@ -367,9 +373,8 @@ struct rt6_statistics {
 	__u32		fib_rt_cache;		/* cached rt entries in exception table */
 	__u32		fib_discarded_routes;	/* total number of routes delete */
 
-	/* The following stats are not protected by any lock */
+	/* The following stat is not protected by any lock */
 	atomic_t	fib_rt_alloc;		/* total number of routes alloced */
-	atomic_t	fib_rt_uncache;		/* rt entries in uncached list */
 };
 
 #define RTN_TL_ROOT	0x0001
@@ -390,6 +395,7 @@ struct fib6_table {
 	struct inet_peer_base	tb6_peers;
 	unsigned int		flags;
 	unsigned int		fib_seq;
+	struct hlist_head       tb6_gc_hlist;	/* GC candidates */
 #define RT6_TABLE_HAS_DFLT_ROUTER	BIT(0)
 };
 
@@ -471,13 +477,10 @@ void rt6_get_prefsrc(const struct rt6_info *rt, struct in6_addr *addr)
 	rcu_read_lock();
 
 	from = rcu_dereference(rt->from);
-	if (from) {
+	if (from)
 		*addr = from->fib6_prefsrc.addr;
-	} else {
-		struct in6_addr in6_zero = {};
-
-		*addr = in6_zero;
-	}
+	else
+		*addr = in6addr_any;
 
 	rcu_read_unlock();
 }
@@ -486,6 +489,7 @@ int fib6_nh_init(struct net *net, struct fib6_nh *fib6_nh,
 		 struct fib6_config *cfg, gfp_t gfp_flags,
 		 struct netlink_ext_ack *extack);
 void fib6_nh_release(struct fib6_nh *fib6_nh);
+void fib6_nh_release_dsts(struct fib6_nh *fib6_nh);
 
 int call_fib6_entry_notifiers(struct net *net,
 			      enum fib_event_type event_type,
@@ -507,6 +511,38 @@ void fib6_run_gc(unsigned long expires, struct net *net, bool force);
 void fib6_gc_cleanup(void);
 
 int fib6_init(void);
+
+/* Add the route to the gc list if it is not already there
+ *
+ * The callers should hold f6i->fib6_table->tb6_lock.
+ */
+static inline void fib6_add_gc_list(struct fib6_info *f6i)
+{
+	/* If fib6_node is null, the f6i is not in (or removed from) the
+	 * table.
+	 *
+	 * There is a gap between finding the f6i from the table and
+	 * calling this function without the protection of the tb6_lock.
+	 * This check makes sure the f6i is not added to the gc list when
+	 * it is not on the table.
+	 */
+	if (!rcu_dereference_protected(f6i->fib6_node,
+				       lockdep_is_held(&f6i->fib6_table->tb6_lock)))
+		return;
+
+	if (hlist_unhashed(&f6i->gc_link))
+		hlist_add_head(&f6i->gc_link, &f6i->fib6_table->tb6_gc_hlist);
+}
+
+/* Remove the route from the gc list if it is on the list.
+ *
+ * The callers should hold f6i->fib6_table->tb6_lock.
+ */
+static inline void fib6_remove_gc_list(struct fib6_info *f6i)
+{
+	if (!hlist_unhashed(&f6i->gc_link))
+		hlist_del_init(&f6i->gc_link);
+}
 
 struct ipv6_route_iter {
 	struct seq_net_private p;
@@ -540,6 +576,50 @@ static inline bool fib6_metric_locked(struct fib6_info *f6i, int metric)
 {
 	return !!(f6i->fib6_metrics->metrics[RTAX_LOCK - 1] & (1 << metric));
 }
+void fib6_info_hw_flags_set(struct net *net, struct fib6_info *f6i,
+			    bool offload, bool trap, bool offload_failed);
+
+#if IS_BUILTIN(CONFIG_IPV6) && defined(CONFIG_BPF_SYSCALL)
+struct bpf_iter__ipv6_route {
+	__bpf_md_ptr(struct bpf_iter_meta *, meta);
+	__bpf_md_ptr(struct fib6_info *, rt);
+};
+#endif
+
+INDIRECT_CALLABLE_DECLARE(struct rt6_info *ip6_pol_route_output(struct net *net,
+					     struct fib6_table *table,
+					     struct flowi6 *fl6,
+					     const struct sk_buff *skb,
+					     int flags));
+INDIRECT_CALLABLE_DECLARE(struct rt6_info *ip6_pol_route_input(struct net *net,
+					     struct fib6_table *table,
+					     struct flowi6 *fl6,
+					     const struct sk_buff *skb,
+					     int flags));
+INDIRECT_CALLABLE_DECLARE(struct rt6_info *__ip6_route_redirect(struct net *net,
+					     struct fib6_table *table,
+					     struct flowi6 *fl6,
+					     const struct sk_buff *skb,
+					     int flags));
+INDIRECT_CALLABLE_DECLARE(struct rt6_info *ip6_pol_route_lookup(struct net *net,
+					     struct fib6_table *table,
+					     struct flowi6 *fl6,
+					     const struct sk_buff *skb,
+					     int flags));
+static inline struct rt6_info *pol_lookup_func(pol_lookup_t lookup,
+						struct net *net,
+						struct fib6_table *table,
+						struct flowi6 *fl6,
+						const struct sk_buff *skb,
+						int flags)
+{
+	return INDIRECT_CALL_4(lookup,
+			       ip6_pol_route_output,
+			       ip6_pol_route_input,
+			       ip6_pol_route_lookup,
+			       __ip6_route_redirect,
+			       net, table, fl6, skb, flags);
+}
 
 #ifdef CONFIG_IPV6_MULTIPLE_TABLES
 static inline bool fib6_has_custom_rules(const struct net *net)
@@ -564,7 +644,10 @@ static inline bool fib6_rules_early_flow_dissect(struct net *net,
 	if (!net->ipv6.fib6_rules_require_fldissect)
 		return false;
 
-	skb_flow_dissect_flow_keys(skb, flkeys, flag);
+	memset(flkeys, 0, sizeof(*flkeys));
+	__skb_flow_dissect(net, skb, &flow_keys_dissector,
+			   flkeys, NULL, 0, 0, 0, flag);
+
 	fl6->fl6_sport = flkeys->ports.src;
 	fl6->fl6_dport = flkeys->ports.dst;
 	fl6->flowi6_proto = flkeys->basic.ip_proto;

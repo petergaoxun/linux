@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Aquantia Corporation Network Driver
- * Copyright (C) 2014-2019 Aquantia Corporation. All rights reserved
+/* Atlantic Network Driver
+ *
+ * Copyright (C) 2014-2019 aQuantia Corporation
+ * Copyright (C) 2019-2020 Marvell International Ltd.
  */
 
 /* File aq_ptp.c:
@@ -17,6 +19,8 @@
 #include "aq_ring.h"
 #include "aq_phy.h"
 #include "aq_filters.h"
+
+#if IS_REACHABLE(CONFIG_PTP_1588_CLOCK)
 
 #define AQ_PTP_TX_TIMEOUT        (HZ *  10)
 
@@ -77,6 +81,8 @@ struct aq_ptp_s {
 
 	bool extts_pin_enabled;
 	u64 last_sync1588_ts;
+
+	bool a1_ptp;
 };
 
 struct ptp_tm_offset {
@@ -547,17 +553,17 @@ void aq_ptp_tx_hwtstamp(struct aq_nic_s *aq_nic, u64 timestamp)
 
 /* aq_ptp_rx_hwtstamp - utility function which checks for RX time stamp
  * @adapter: pointer to adapter struct
- * @skb: particular skb to send timestamp with
+ * @shhwtstamps: particular skb_shared_hwtstamps to save timestamp
  *
  * if the timestamp is valid, we convert it into the timecounter ns
  * value, then store that result into the hwtstamps structure which
  * is passed up the network stack
  */
-static void aq_ptp_rx_hwtstamp(struct aq_ptp_s *aq_ptp, struct sk_buff *skb,
+static void aq_ptp_rx_hwtstamp(struct aq_ptp_s *aq_ptp, struct skb_shared_hwtstamps *shhwtstamps,
 			       u64 timestamp)
 {
 	timestamp -= atomic_read(&aq_ptp->offset_ingress);
-	aq_ptp_convert_to_hwtstamp(aq_ptp, skb_hwtstamps(skb), timestamp);
+	aq_ptp_convert_to_hwtstamp(aq_ptp, shhwtstamps, timestamp);
 }
 
 void aq_ptp_hwtstamp_config_get(struct aq_ptp_s *aq_ptp,
@@ -633,7 +639,7 @@ bool aq_ptp_ring(struct aq_nic_s *aq_nic, struct aq_ring_s *ring)
 	       &aq_ptp->ptp_rx == ring || &aq_ptp->hwts_rx == ring;
 }
 
-u16 aq_ptp_extract_ts(struct aq_nic_s *aq_nic, struct sk_buff *skb, u8 *p,
+u16 aq_ptp_extract_ts(struct aq_nic_s *aq_nic, struct skb_shared_hwtstamps *shhwtstamps, u8 *p,
 		      unsigned int len)
 {
 	struct aq_ptp_s *aq_ptp = aq_nic->aq_ptp;
@@ -642,7 +648,7 @@ u16 aq_ptp_extract_ts(struct aq_nic_s *aq_nic, struct sk_buff *skb, u8 *p,
 						   p, len, &timestamp);
 
 	if (ret > 0)
-		aq_ptp_rx_hwtstamp(aq_ptp, skb, timestamp);
+		aq_ptp_rx_hwtstamp(aq_ptp, shhwtstamps, timestamp);
 
 	return ret;
 }
@@ -778,8 +784,10 @@ int aq_ptp_xmit(struct aq_nic_s *aq_nic, struct sk_buff *skb)
 		err = aq_nic->aq_hw_ops->hw_ring_tx_xmit(aq_nic->aq_hw,
 						       ring, frags);
 		if (err >= 0) {
+			u64_stats_update_begin(&ring->stats.tx.syncp);
 			++ring->stats.tx.packets;
 			ring->stats.tx.bytes += skb->len;
+			u64_stats_update_end(&ring->stats.tx.syncp);
 		}
 	} else {
 		err = NETDEV_TX_BUSY;
@@ -840,7 +848,7 @@ int aq_ptp_ring_init(struct aq_nic_s *aq_nic)
 	if (!aq_ptp)
 		return 0;
 
-	err = aq_ring_init(&aq_ptp->ptp_tx);
+	err = aq_ring_init(&aq_ptp->ptp_tx, ATL_RING_TX);
 	if (err < 0)
 		goto err_exit;
 	err = aq_nic->aq_hw_ops->hw_ring_tx_init(aq_nic->aq_hw,
@@ -849,7 +857,7 @@ int aq_ptp_ring_init(struct aq_nic_s *aq_nic)
 	if (err < 0)
 		goto err_exit;
 
-	err = aq_ring_init(&aq_ptp->ptp_rx);
+	err = aq_ring_init(&aq_ptp->ptp_rx, ATL_RING_RX);
 	if (err < 0)
 		goto err_exit;
 	err = aq_nic->aq_hw_ops->hw_ring_rx_init(aq_nic->aq_hw,
@@ -867,7 +875,7 @@ int aq_ptp_ring_init(struct aq_nic_s *aq_nic)
 	if (err < 0)
 		goto err_rx_free;
 
-	err = aq_ring_init(&aq_ptp->hwts_rx);
+	err = aq_ring_init(&aq_ptp->hwts_rx, ATL_RING_RX);
 	if (err < 0)
 		goto err_rx_free;
 	err = aq_nic->aq_hw_ops->hw_ring_rx_init(aq_nic->aq_hw,
@@ -941,58 +949,34 @@ void aq_ptp_ring_deinit(struct aq_nic_s *aq_nic)
 	aq_ring_rx_deinit(&aq_ptp->ptp_rx);
 }
 
-#define PTP_8TC_RING_IDX             8
-#define PTP_4TC_RING_IDX            16
-#define PTP_HWST_RING_IDX           31
-
 int aq_ptp_ring_alloc(struct aq_nic_s *aq_nic)
 {
 	struct aq_ptp_s *aq_ptp = aq_nic->aq_ptp;
 	unsigned int tx_ring_idx, rx_ring_idx;
-	struct aq_ring_s *hwts;
-	u32 tx_tc_mode, rx_tc_mode;
-	struct aq_ring_s *ring;
 	int err;
 
 	if (!aq_ptp)
 		return 0;
 
-	/* Index must to be 8 (8 TCs) or 16 (4 TCs).
-	 * It depends from Traffic Class mode.
-	 */
-	aq_nic->aq_hw_ops->hw_tx_tc_mode_get(aq_nic->aq_hw, &tx_tc_mode);
-	if (tx_tc_mode == 0)
-		tx_ring_idx = PTP_8TC_RING_IDX;
-	else
-		tx_ring_idx = PTP_4TC_RING_IDX;
+	tx_ring_idx = aq_ptp_ring_idx(aq_nic->aq_nic_cfg.tc_mode);
 
-	ring = aq_ring_tx_alloc(&aq_ptp->ptp_tx, aq_nic,
-				tx_ring_idx, &aq_nic->aq_nic_cfg);
-	if (!ring) {
-		err = -ENOMEM;
+	err = aq_ring_tx_alloc(&aq_ptp->ptp_tx, aq_nic,
+			       tx_ring_idx, &aq_nic->aq_nic_cfg);
+	if (err)
 		goto err_exit;
-	}
 
-	aq_nic->aq_hw_ops->hw_rx_tc_mode_get(aq_nic->aq_hw, &rx_tc_mode);
-	if (rx_tc_mode == 0)
-		rx_ring_idx = PTP_8TC_RING_IDX;
-	else
-		rx_ring_idx = PTP_4TC_RING_IDX;
+	rx_ring_idx = aq_ptp_ring_idx(aq_nic->aq_nic_cfg.tc_mode);
 
-	ring = aq_ring_rx_alloc(&aq_ptp->ptp_rx, aq_nic,
-				rx_ring_idx, &aq_nic->aq_nic_cfg);
-	if (!ring) {
-		err = -ENOMEM;
+	err = aq_ring_rx_alloc(&aq_ptp->ptp_rx, aq_nic,
+			       rx_ring_idx, &aq_nic->aq_nic_cfg);
+	if (err)
 		goto err_exit_ptp_tx;
-	}
 
-	hwts = aq_ring_hwts_rx_alloc(&aq_ptp->hwts_rx, aq_nic, PTP_HWST_RING_IDX,
-				     aq_nic->aq_nic_cfg.rxds,
-				     aq_nic->aq_nic_cfg.aq_hw_caps->rxd_size);
-	if (!hwts) {
-		err = -ENOMEM;
+	err = aq_ring_hwts_rx_alloc(&aq_ptp->hwts_rx, aq_nic, PTP_HWST_RING_IDX,
+				    aq_nic->aq_nic_cfg.rxds,
+				    aq_nic->aq_nic_cfg.aq_hw_caps->rxd_size);
+	if (err)
 		goto err_exit_ptp_rx;
-	}
 
 	err = aq_ptp_skb_ring_init(&aq_ptp->skb_ring, aq_nic->aq_nic_cfg.rxds);
 	if (err != 0) {
@@ -1009,7 +993,7 @@ int aq_ptp_ring_alloc(struct aq_nic_s *aq_nic)
 	return 0;
 
 err_exit_hwts_rx:
-	aq_ring_free(&aq_ptp->hwts_rx);
+	aq_ring_hwts_rx_free(&aq_ptp->hwts_rx);
 err_exit_ptp_rx:
 	aq_ring_free(&aq_ptp->ptp_rx);
 err_exit_ptp_tx:
@@ -1027,7 +1011,7 @@ void aq_ptp_ring_free(struct aq_nic_s *aq_nic)
 
 	aq_ring_free(&aq_ptp->ptp_tx);
 	aq_ring_free(&aq_ptp->ptp_rx);
-	aq_ring_free(&aq_ptp->hwts_rx);
+	aq_ring_hwts_rx_free(&aq_ptp->hwts_rx);
 
 	aq_ptp_skb_ring_release(&aq_ptp->skb_ring);
 }
@@ -1169,10 +1153,16 @@ static void aq_ptp_poll_sync_work_cb(struct work_struct *w);
 
 int aq_ptp_init(struct aq_nic_s *aq_nic, unsigned int idx_vec)
 {
+	bool a1_ptp = ATL_HW_IS_CHIP_FEATURE(aq_nic->aq_hw, ATLANTIC);
 	struct hw_atl_utils_mbox mbox;
 	struct ptp_clock *clock;
 	struct aq_ptp_s *aq_ptp;
 	int err = 0;
+
+	if (!a1_ptp) {
+		aq_nic->aq_ptp = NULL;
+		return 0;
+	}
 
 	if (!aq_nic->aq_hw_ops->hw_get_ptp_ts) {
 		aq_nic->aq_ptp = NULL;
@@ -1200,6 +1190,7 @@ int aq_ptp_init(struct aq_nic_s *aq_nic, unsigned int idx_vec)
 	}
 
 	aq_ptp->aq_nic = aq_nic;
+	aq_ptp->a1_ptp = a1_ptp;
 
 	spin_lock_init(&aq_ptp->ptp_lock);
 	spin_lock_init(&aq_ptp->ptp_ring_lock);
@@ -1218,8 +1209,7 @@ int aq_ptp_init(struct aq_nic_s *aq_nic, unsigned int idx_vec)
 	atomic_set(&aq_ptp->offset_egress, 0);
 	atomic_set(&aq_ptp->offset_ingress, 0);
 
-	netif_napi_add(aq_nic_get_ndev(aq_nic), &aq_ptp->napi,
-		       aq_ptp_poll, AQ_CFG_NAPI_WEIGHT);
+	netif_napi_add(aq_nic_get_ndev(aq_nic), &aq_ptp->napi, aq_ptp_poll);
 
 	aq_ptp->idx_vector = idx_vec;
 
@@ -1390,3 +1380,36 @@ static void aq_ptp_poll_sync_work_cb(struct work_struct *w)
 		schedule_delayed_work(&aq_ptp->poll_sync, timeout);
 	}
 }
+
+int aq_ptp_get_ring_cnt(struct aq_nic_s *aq_nic, const enum atl_ring_type ring_type)
+{
+	if (!aq_nic->aq_ptp)
+		return 0;
+
+	/* Additional RX ring is allocated for PTP HWTS on A1 */
+	return (aq_nic->aq_ptp->a1_ptp && ring_type == ATL_RING_RX) ? 2 : 1;
+}
+
+u64 *aq_ptp_get_stats(struct aq_nic_s *aq_nic, u64 *data)
+{
+	struct aq_ptp_s *aq_ptp = aq_nic->aq_ptp;
+	unsigned int count = 0U;
+
+	if (!aq_ptp)
+		return data;
+
+	count = aq_ring_fill_stats_data(&aq_ptp->ptp_rx, data);
+	data += count;
+	count = aq_ring_fill_stats_data(&aq_ptp->ptp_tx, data);
+	data += count;
+
+	if (aq_ptp->a1_ptp) {
+		/* Only Receive ring for HWTS */
+		count = aq_ring_fill_stats_data(&aq_ptp->hwts_rx, data);
+		data += count;
+	}
+
+	return data;
+}
+
+#endif

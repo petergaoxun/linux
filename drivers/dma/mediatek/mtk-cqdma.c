@@ -18,7 +18,6 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -356,9 +355,9 @@ static struct mtk_cqdma_vdesc
 	return ret;
 }
 
-static void mtk_cqdma_tasklet_cb(unsigned long data)
+static void mtk_cqdma_tasklet_cb(struct tasklet_struct *t)
 {
-	struct mtk_cqdma_pchan *pc = (struct mtk_cqdma_pchan *)data;
+	struct mtk_cqdma_pchan *pc = from_tasklet(pc, t, tasklet);
 	struct mtk_cqdma_vdesc *cvd = NULL;
 	unsigned long flags;
 
@@ -373,7 +372,7 @@ static void mtk_cqdma_tasklet_cb(unsigned long data)
 
 		/*
 		 * free child CVD after completion.
-		 * the parent CVD would be freeed with desc_free by user.
+		 * the parent CVD would be freed with desc_free by user.
 		 */
 		if (cvd->parent != cvd)
 			kfree(cvd);
@@ -751,7 +750,6 @@ static int mtk_cqdma_probe(struct platform_device *pdev)
 	struct mtk_cqdma_device *cqdma;
 	struct mtk_cqdma_vchan *vc;
 	struct dma_device *dd;
-	struct resource *res;
 	int err;
 	u32 i;
 
@@ -824,13 +822,10 @@ static int mtk_cqdma_probe(struct platform_device *pdev)
 			return PTR_ERR(cqdma->pc[i]->base);
 
 		/* allocate IRQ resource */
-		res = platform_get_resource(pdev, IORESOURCE_IRQ, i);
-		if (!res) {
-			dev_err(&pdev->dev, "No irq resource for %s\n",
-				dev_name(&pdev->dev));
-			return -EINVAL;
-		}
-		cqdma->pc[i]->irq = res->start;
+		err = platform_get_irq(pdev, i);
+		if (err < 0)
+			return err;
+		cqdma->pc[i]->irq = err;
 
 		err = devm_request_irq(&pdev->dev, cqdma->pc[i]->irq,
 				       mtk_cqdma_irq, 0, dev_name(&pdev->dev),
@@ -878,8 +873,7 @@ static int mtk_cqdma_probe(struct platform_device *pdev)
 
 	/* initialize tasklet for each PC */
 	for (i = 0; i < cqdma->dma_channels; ++i)
-		tasklet_init(&cqdma->pc[i]->tasklet, mtk_cqdma_tasklet_cb,
-			     (unsigned long)cqdma->pc[i]);
+		tasklet_setup(&cqdma->pc[i]->tasklet, mtk_cqdma_tasklet_cb);
 
 	dev_info(&pdev->dev, "MediaTek CQDMA driver registered\n");
 
@@ -891,7 +885,7 @@ err_unregister:
 	return err;
 }
 
-static int mtk_cqdma_remove(struct platform_device *pdev)
+static void mtk_cqdma_remove(struct platform_device *pdev)
 {
 	struct mtk_cqdma_device *cqdma = platform_get_drvdata(pdev);
 	struct mtk_cqdma_vchan *vc;
@@ -924,13 +918,11 @@ static int mtk_cqdma_remove(struct platform_device *pdev)
 
 	dma_async_device_unregister(&cqdma->ddev);
 	of_dma_controller_free(pdev->dev.of_node);
-
-	return 0;
 }
 
 static struct platform_driver mtk_cqdma_driver = {
 	.probe = mtk_cqdma_probe,
-	.remove = mtk_cqdma_remove,
+	.remove_new = mtk_cqdma_remove,
 	.driver = {
 		.name           = KBUILD_MODNAME,
 		.of_match_table = mtk_cqdma_match,

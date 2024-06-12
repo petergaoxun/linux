@@ -35,7 +35,7 @@ static struct sec_name_test tests[] = {
 		{-EINVAL, 0},
 	},
 	{"raw_tp/", {0, BPF_PROG_TYPE_RAW_TRACEPOINT, 0}, {-EINVAL, 0} },
-	{"xdp", {0, BPF_PROG_TYPE_XDP, 0}, {-EINVAL, 0} },
+	{"xdp", {0, BPF_PROG_TYPE_XDP, BPF_XDP}, {0, BPF_XDP} },
 	{"perf_event", {0, BPF_PROG_TYPE_PERF_EVENT, 0}, {-EINVAL, 0} },
 	{"lwt_in", {0, BPF_PROG_TYPE_LWT_IN, 0}, {-EINVAL, 0} },
 	{"lwt_out", {0, BPF_PROG_TYPE_LWT_OUT, 0}, {-EINVAL, 0} },
@@ -43,18 +43,18 @@ static struct sec_name_test tests[] = {
 	{"lwt_seg6local", {0, BPF_PROG_TYPE_LWT_SEG6LOCAL, 0}, {-EINVAL, 0} },
 	{
 		"cgroup_skb/ingress",
-		{0, BPF_PROG_TYPE_CGROUP_SKB, 0},
+		{0, BPF_PROG_TYPE_CGROUP_SKB, BPF_CGROUP_INET_INGRESS},
 		{0, BPF_CGROUP_INET_INGRESS},
 	},
 	{
 		"cgroup_skb/egress",
-		{0, BPF_PROG_TYPE_CGROUP_SKB, 0},
+		{0, BPF_PROG_TYPE_CGROUP_SKB, BPF_CGROUP_INET_EGRESS},
 		{0, BPF_CGROUP_INET_EGRESS},
 	},
 	{"cgroup/skb", {0, BPF_PROG_TYPE_CGROUP_SKB, 0}, {-EINVAL, 0} },
 	{
 		"cgroup/sock",
-		{0, BPF_PROG_TYPE_CGROUP_SOCK, 0},
+		{0, BPF_PROG_TYPE_CGROUP_SOCK, BPF_CGROUP_INET_SOCK_CREATE},
 		{0, BPF_CGROUP_INET_SOCK_CREATE},
 	},
 	{
@@ -69,26 +69,38 @@ static struct sec_name_test tests[] = {
 	},
 	{
 		"cgroup/dev",
-		{0, BPF_PROG_TYPE_CGROUP_DEVICE, 0},
+		{0, BPF_PROG_TYPE_CGROUP_DEVICE, BPF_CGROUP_DEVICE},
 		{0, BPF_CGROUP_DEVICE},
 	},
-	{"sockops", {0, BPF_PROG_TYPE_SOCK_OPS, 0}, {0, BPF_CGROUP_SOCK_OPS} },
+	{
+		"sockops",
+		{0, BPF_PROG_TYPE_SOCK_OPS, BPF_CGROUP_SOCK_OPS},
+		{0, BPF_CGROUP_SOCK_OPS},
+	},
 	{
 		"sk_skb/stream_parser",
-		{0, BPF_PROG_TYPE_SK_SKB, 0},
+		{0, BPF_PROG_TYPE_SK_SKB, BPF_SK_SKB_STREAM_PARSER},
 		{0, BPF_SK_SKB_STREAM_PARSER},
 	},
 	{
 		"sk_skb/stream_verdict",
-		{0, BPF_PROG_TYPE_SK_SKB, 0},
+		{0, BPF_PROG_TYPE_SK_SKB, BPF_SK_SKB_STREAM_VERDICT},
 		{0, BPF_SK_SKB_STREAM_VERDICT},
 	},
 	{"sk_skb", {0, BPF_PROG_TYPE_SK_SKB, 0}, {-EINVAL, 0} },
-	{"sk_msg", {0, BPF_PROG_TYPE_SK_MSG, 0}, {0, BPF_SK_MSG_VERDICT} },
-	{"lirc_mode2", {0, BPF_PROG_TYPE_LIRC_MODE2, 0}, {0, BPF_LIRC_MODE2} },
+	{
+		"sk_msg",
+		{0, BPF_PROG_TYPE_SK_MSG, BPF_SK_MSG_VERDICT},
+		{0, BPF_SK_MSG_VERDICT},
+	},
+	{
+		"lirc_mode2",
+		{0, BPF_PROG_TYPE_LIRC_MODE2, BPF_LIRC_MODE2},
+		{0, BPF_LIRC_MODE2},
+	},
 	{
 		"flow_dissector",
-		{0, BPF_PROG_TYPE_FLOW_DISSECTOR, 0},
+		{0, BPF_PROG_TYPE_FLOW_DISSECTOR, BPF_FLOW_DISSECTOR},
 		{0, BPF_FLOW_DISSECTOR},
 	},
 	{
@@ -112,6 +124,11 @@ static struct sec_name_test tests[] = {
 		{0, BPF_CGROUP_INET6_CONNECT},
 	},
 	{
+		"cgroup/connect_unix",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_CONNECT},
+		{0, BPF_CGROUP_UNIX_CONNECT},
+	},
+	{
 		"cgroup/sendmsg4",
 		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UDP4_SENDMSG},
 		{0, BPF_CGROUP_UDP4_SENDMSG},
@@ -122,6 +139,11 @@ static struct sec_name_test tests[] = {
 		{0, BPF_CGROUP_UDP6_SENDMSG},
 	},
 	{
+		"cgroup/sendmsg_unix",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_SENDMSG},
+		{0, BPF_CGROUP_UNIX_SENDMSG},
+	},
+	{
 		"cgroup/recvmsg4",
 		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UDP4_RECVMSG},
 		{0, BPF_CGROUP_UDP4_RECVMSG},
@@ -130,6 +152,11 @@ static struct sec_name_test tests[] = {
 		"cgroup/recvmsg6",
 		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UDP6_RECVMSG},
 		{0, BPF_CGROUP_UDP6_RECVMSG},
+	},
+	{
+		"cgroup/recvmsg_unix",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_RECVMSG},
+		{0, BPF_CGROUP_UNIX_RECVMSG},
 	},
 	{
 		"cgroup/sysctl",
@@ -146,6 +173,36 @@ static struct sec_name_test tests[] = {
 		{0, BPF_PROG_TYPE_CGROUP_SOCKOPT, BPF_CGROUP_SETSOCKOPT},
 		{0, BPF_CGROUP_SETSOCKOPT},
 	},
+	{
+		"cgroup/getpeername4",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_GETPEERNAME},
+		{0, BPF_CGROUP_INET4_GETPEERNAME},
+	},
+	{
+		"cgroup/getpeername6",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_GETPEERNAME},
+		{0, BPF_CGROUP_INET6_GETPEERNAME},
+	},
+	{
+		"cgroup/getpeername_unix",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_GETPEERNAME},
+		{0, BPF_CGROUP_UNIX_GETPEERNAME},
+	},
+	{
+		"cgroup/getsockname4",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_GETSOCKNAME},
+		{0, BPF_CGROUP_INET4_GETSOCKNAME},
+	},
+	{
+		"cgroup/getsockname6",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_GETSOCKNAME},
+		{0, BPF_CGROUP_INET6_GETSOCKNAME},
+	},
+	{
+		"cgroup/getsockname_unix",
+		{0, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_GETSOCKNAME},
+		{0, BPF_CGROUP_UNIX_GETSOCKNAME},
+	},
 };
 
 static void test_prog_type_by_name(const struct sec_name_test *test)
@@ -158,17 +215,17 @@ static void test_prog_type_by_name(const struct sec_name_test *test)
 				      &expected_attach_type);
 
 	CHECK(rc != test->expected_load.rc, "check_code",
-	      "prog: unexpected rc=%d for %s", rc, test->sec_name);
+	      "prog: unexpected rc=%d for %s\n", rc, test->sec_name);
 
 	if (rc)
 		return;
 
 	CHECK(prog_type != test->expected_load.prog_type, "check_prog_type",
-	      "prog: unexpected prog_type=%d for %s",
+	      "prog: unexpected prog_type=%d for %s\n",
 	      prog_type, test->sec_name);
 
 	CHECK(expected_attach_type != test->expected_load.expected_attach_type,
-	      "check_attach_type", "prog: unexpected expected_attach_type=%d for %s",
+	      "check_attach_type", "prog: unexpected expected_attach_type=%d for %s\n",
 	      expected_attach_type, test->sec_name);
 }
 
@@ -180,13 +237,13 @@ static void test_attach_type_by_name(const struct sec_name_test *test)
 	rc = libbpf_attach_type_by_name(test->sec_name, &attach_type);
 
 	CHECK(rc != test->expected_attach.rc, "check_ret",
-	      "attach: unexpected rc=%d for %s", rc, test->sec_name);
+	      "attach: unexpected rc=%d for %s\n", rc, test->sec_name);
 
 	if (rc)
 		return;
 
 	CHECK(attach_type != test->expected_attach.attach_type,
-	      "check_attach_type", "attach: unexpected attach_type=%d for %s",
+	      "check_attach_type", "attach: unexpected attach_type=%d for %s\n",
 	      attach_type, test->sec_name);
 }
 

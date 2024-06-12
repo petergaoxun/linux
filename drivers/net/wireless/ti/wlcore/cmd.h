@@ -208,8 +208,6 @@ enum cmd_templ {
 struct wl1271_cmd_header {
 	__le16 id;
 	__le16 status;
-	/* payload */
-	u8 data[0];
 } __packed;
 
 #define WL1271_CMD_MAX_PARAMS 572
